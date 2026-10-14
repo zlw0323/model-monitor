@@ -1,0 +1,34 @@
+services:
+  monitor:
+    build: .
+    image: model-monitor:latest
+    container_name: model-monitor
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - monitor_data:/data
+    # Default: only reachable from the server itself (use the Caddy profile for public HTTPS access).
+    # Set APP_BIND=0.0.0.0 in .env to expose plain HTTP on port 8000 directly.
+    ports:
+      - "${APP_BIND:-127.0.0.1}:8000:8000"
+
+  caddy:
+    image: caddy:2
+    profiles: ["https"]
+    container_name: model-monitor-caddy
+    restart: unless-stopped
+    depends_on: [monitor]
+    environment:
+      - DOMAIN=${DOMAIN:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  monitor_data:
+  caddy_data:
+  caddy_config:

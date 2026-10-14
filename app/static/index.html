@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>模型监控平台</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/vendor/chart.umd.min.js"></script>
+</head>
+<body>
+  <!-- 登录 -->
+  <section id="login-view" class="login hidden">
+    <form id="login-form" class="card login-card">
+      <h1>模型监控平台</h1>
+      <label>用户名<input name="username" autocomplete="username" required></label>
+      <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+      <p class="error" id="login-error"></p>
+      <button class="btn primary" type="submit">登录</button>
+    </form>
+  </section>
+
+  <!-- 主界面 -->
+  <section id="app-view" class="hidden">
+    <header class="topbar">
+      <div class="brand">模型监控平台</div>
+      <nav>
+        <a href="#dashboard" data-tab="dashboard">监控面板</a>
+        <a href="#alerts" data-tab="alerts">报警记录</a>
+        <a href="#settings" data-tab="settings">设置</a>
+      </nav>
+      <button class="btn ghost" id="logout-btn">退出</button>
+    </header>
+
+    <main>
+      <div id="tab-dashboard" class="tab">
+        <div class="toolbar">
+          <div class="summary" id="summary"></div>
+          <div class="toolbar-right">
+            <select id="range-select" title="图表时间范围">
+              <option value="24">最近 24 小时</option>
+              <option value="168">最近 7 天</option>
+              <option value="720">最近 30 天</option>
+            </select>
+            <button class="btn primary" id="add-model-btn">+ 添加模型</button>
+          </div>
+        </div>
+        <div id="model-grid" class="grid"></div>
+        <p id="empty-hint" class="muted hidden">还没有模型。点击右上角“添加模型”，填入 Foundry 的端点、部署名称和 API Key。</p>
+      </div>
+
+      <div id="tab-alerts" class="tab hidden">
+        <div class="card">
+          <h2>报警记录</h2>
+          <table class="table">
+            <thead><tr><th>时间</th><th>模型</th><th>类型</th><th>标题</th><th>邮件</th><th></th></tr></thead>
+            <tbody id="alerts-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="tab-settings" class="tab hidden">
+        <form id="monitor-settings-form" class="card">
+          <h2>监控参数</h2>
+          <div class="form-grid">
+            <label>新模型默认检测间隔（分钟）<input name="default_interval_minutes" type="number" min="1" max="1440" required></label>
+            <label>TTFT 预警阈值（超出基线 %）<input name="ttft_threshold_pct" type="number" min="1" step="any" required></label>
+            <label>基线样本窗口（最近 N 次正常检测的中位数）<input name="baseline_window" type="number" min="3" required></label>
+            <label>启用 TTFT 预警的最少样本数<input name="baseline_min_samples" type="number" min="1" required></label>
+            <label>异常后重测次数<input name="retry_count" type="number" min="0" max="10" required></label>
+            <label>重测间隔（秒）<input name="retry_gap_seconds" type="number" min="0" max="600" required></label>
+            <label>历史数据保留（天）<input name="retention_days" type="number" min="1" required></label>
+          </div>
+          <p class="muted">单个模型可以在编辑页覆盖阈值、设置手动基线。</p>
+          <div class="actions"><button class="btn primary" type="submit">保存</button><span class="msg"></span></div>
+        </form>
+
+        <form id="smtp-settings-form" class="card">
+          <h2>邮件报警（SMTP）</h2>
+          <div class="form-grid">
+            <label>SMTP 服务器<input name="smtp_host" placeholder="smtp.exmail.qq.com"></label>
+            <label>端口<input name="smtp_port" type="number" min="1" max="65535"></label>
+            <label>加密方式
+              <select name="smtp_security">
+                <option value="ssl">SSL/TLS（通常 465）</option>
+                <option value="starttls">STARTTLS（通常 587）</option>
+                <option value="none">不加密（通常 25）</option>
+              </select>
+            </label>
+            <label>用户名<input name="smtp_username" autocomplete="off"></label>
+            <label>密码 / 授权码<input name="smtp_password" type="password" autocomplete="new-password" placeholder="留空则保持不变"></label>
+            <label>发件人（留空则使用用户名）<input name="smtp_from"></label>
+            <label class="span2">收件人（多个用逗号分隔）<input name="smtp_to" placeholder="ops@example.com, boss@example.com"></label>
+          </div>
+          <label class="checkbox"><input type="checkbox" name="smtp_password_clear"> 清除已保存的密码</label>
+          <p class="muted small">“发送测试邮件”使用的是已保存的配置，修改后请先保存。</p>
+          <div class="actions">
+            <button class="btn primary" type="submit">保存</button>
+            <button class="btn" type="button" id="test-email-btn">发送测试邮件</button>
+            <span class="msg"></span>
+          </div>
+        </form>
+      </div>
+    </main>
+  </section>
+
+  <!-- 添加/编辑模型 -->
+  <dialog id="model-dialog">
+    <form id="model-form" method="dialog">
+      <h2 id="model-dialog-title">添加模型</h2>
+      <div class="form-grid">
+        <label>显示名称<input name="name" required maxlength="100" placeholder="GPT-5 美东2"></label>
+        <label>模型类型
+          <select name="kind">
+            <option value="text">文本 / 推理模型（流式测 TTFT）</option>
+            <option value="image">图像模型（TTFT = 完整出图耗时）</option>
+          </select>
+        </label>
+        <label class="span2">端点 Endpoint
+          <input name="endpoint" required placeholder="https://your-resource.openai.azure.com/">
+          <small class="muted">支持 *.openai.azure.com / *.services.ai.azure.com / *.cognitiveservices.azure.com，自动使用 v1 API（/openai/v1）；也可粘贴完整请求 URL。</small>
+        </label>
+        <label>部署名称 Deployment<input name="deployment" maxlength="200" placeholder="gpt-5"></label>
+        <label>API Key<input name="api_key" type="password" autocomplete="new-password" placeholder=""></label>
+        <label>检测间隔（分钟）<input name="interval_minutes" type="number" min="1" max="1440" required></label>
+        <label>TTFT 预警阈值 %（留空=全局）<input name="ttft_threshold_pct" type="number" min="1" step="any"></label>
+        <label>手动基线 TTFT ms（留空=自动）<input name="baseline_manual_ms" type="number" min="1" step="any"></label>
+        <label class="checkbox"><input type="checkbox" name="enabled" checked> 启用监控</label>
+      </div>
+      <p class="error" id="model-form-error"></p>
+      <div class="actions">
+        <button class="btn" type="button" id="model-cancel">取消</button>
+        <button class="btn primary" type="submit">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 模型详情 -->
+  <dialog id="detail-dialog" class="wide">
+    <div class="detail-head">
+      <h2 id="detail-title"></h2>
+      <div>
+        <button class="btn" id="detail-reset-baseline">重置自动基线</button>
+        <button class="btn" id="detail-close">关闭</button>
+      </div>
+    </div>
+    <p class="muted" id="detail-meta"></p>
+    <div class="chart-wrap big"><canvas id="detail-chart"></canvas></div>
+    <table class="table compact">
+      <thead><tr><th>时间</th><th>触发</th><th>轮次</th><th>结果</th><th>TTFT</th><th>总耗时</th><th>HTTP</th><th>错误</th></tr></thead>
+      <tbody id="detail-body"></tbody>
+    </table>
+  </dialog>
+
+  <!-- 报警详情 -->
+  <dialog id="alert-dialog" class="wide">
+    <div class="detail-head"><h2 id="alert-title"></h2><button class="btn" id="alert-close">关闭</button></div>
+    <pre id="alert-message"></pre>
+  </dialog>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
