@@ -49,7 +49,8 @@ CREATE TABLE IF NOT EXISTS alerts (
     kind TEXT NOT NULL,
     subject TEXT NOT NULL,
     message TEXT NOT NULL,
-    email_status TEXT
+    email_status TEXT,
+    feishu_status TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts);
 CREATE TABLE IF NOT EXISTS settings (
@@ -69,6 +70,9 @@ class Database:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(SCHEMA)
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(alerts)")}
+            if "feishu_status" not in cols:
+                self._conn.execute("ALTER TABLE alerts ADD COLUMN feishu_status TEXT")
             for k, v in DEFAULT_SETTINGS.items():
                 self._conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (k, v))
 
@@ -175,17 +179,29 @@ class Database:
     # ---- alerts ----
     def insert_alert(self, model_id: int, kind: str, subject: str, message: str) -> int:
         cur = self.execute(
-            "INSERT INTO alerts (model_id, ts, kind, subject, message, email_status) VALUES (?, ?, ?, ?, ?, ?)",
-            (model_id, time.time(), kind, subject, message, "发送中"),
+            "INSERT INTO alerts (model_id, ts, kind, subject, message, email_status, feishu_status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (model_id, time.time(), kind, subject, message, "发送中", "发送中"),
         )
         return int(cur.lastrowid)
 
-    def set_alert_email_status(self, alert_id: int, status: str) -> None:
-        self.execute("UPDATE alerts SET email_status = ? WHERE id = ?", (status, alert_id))
+    def set_alert_status(self, alert_id: int, email_status: str, feishu_status: str) -> None:
+        self.execute(
+            "UPDATE alerts SET email_status = ?, feishu_status = ? WHERE id = ?", (email_status, feishu_status, alert_id)
+        )
+
+    def delete_alerts(self, ids: list[int] | None) -> int:
+        """Delete the given alerts, or all alerts when ids is None."""
+        if ids is None:
+            return self.execute("DELETE FROM alerts").rowcount
+        if not ids:
+            return 0
+        marks = ", ".join("?" for _ in ids)
+        return self.execute(f"DELETE FROM alerts WHERE id IN ({marks})", tuple(ids)).rowcount
 
     def list_alerts(self, limit: int = 200) -> list[dict[str, Any]]:
         return self.all(
             "SELECT a.*, m.name AS model_name FROM alerts a LEFT JOIN models m ON m.id = a.model_id "
-            "ORDER BY a.ts DESC LIMIT ?",
+            "ORDER BY a.ts DESC, a.id DESC LIMIT ?",
             (limit,),
         )

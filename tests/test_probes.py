@@ -137,7 +137,7 @@ def test_probe_image_success_and_defaults():
 
     r = asyncio.run(run())
     assert r.success and r.ttft_ms == r.total_ms
-    assert seen["body"] == {"model": "gpt-image-1", "prompt": config.IMAGE_PROMPT}
+    assert seen["body"] == {"model": "gpt-image-1", "prompt": config.IMAGE_PROMPT, "quality": "low", "size": "1024x1024"}
     assert seen["url"] == "https://r.openai.azure.com/openai/v1/images/generations"
 
 

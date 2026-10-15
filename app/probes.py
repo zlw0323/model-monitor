@@ -152,7 +152,12 @@ async def probe_text(
 async def probe_image(client: httpx.AsyncClient, endpoint: str, deployment: str, api_key: str) -> ProbeResult:
     """Image endpoints don't stream by default, so TTFT == time until the full image response arrives."""
     url = build_url(endpoint, "image")
-    body = {"model": deployment, "prompt": config.IMAGE_PROMPT}
+    body = {
+        "model": deployment,
+        "prompt": config.IMAGE_PROMPT,
+        "quality": config.IMAGE_QUALITY,
+        "size": config.IMAGE_SIZE,
+    }
     t0 = time.perf_counter()
     status = None
     try:

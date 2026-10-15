@@ -379,18 +379,69 @@ $("#model-form").addEventListener("submit", async (e) => {
 
 // ---------- alerts ----------
 let alertsCache = [];
+function selectedAlertIds() {
+  return $$("#alerts-body input[data-id]:checked").map((el) => Number(el.dataset.id));
+}
+function syncAlertSelection() {
+  const boxes = $$("#alerts-body input[data-id]");
+  boxes.forEach((b) => b.closest("tr").classList.toggle("selected", b.checked));
+  const checked = boxes.filter((b) => b.checked).length;
+  $("#alerts-delete-selected").disabled = checked === 0;
+  $("#alerts-delete-selected").textContent = checked ? `删除选中 (${checked})` : "删除选中";
+  $("#alerts-check-all").checked = boxes.length > 0 && checked === boxes.length;
+  $("#alerts-check-all").indeterminate = checked > 0 && checked < boxes.length;
+}
+function deliveryBadge(status) {
+  if (!status) return '<span class="badge muted">-</span>';
+  const s = String(status);
+  const [cls, label] = s.startsWith("已发送") ? ["ok", "已发送"]
+    : s.startsWith("未发送") ? ["muted", "未配置"]
+    : s.startsWith("发送中") ? ["info", "发送中"]
+    : ["bad", "失败"];
+  return `<span class="badge ${cls}" title="${esc(s)}">${label}</span>`;
+}
 async function loadAlerts() {
   alertsCache = await api("/api/alerts").catch(() => []);
   $("#alerts-body").innerHTML = alertsCache.map((a, i) => {
     const cls = a.kind === "recovered" ? "ok" : a.kind === "slow" ? "warn" : "bad";
-    return `<tr><td>${fmtTime(a.ts)}</td><td>${esc(a.model_name || "(已删除)")}</td><td><span class="badge ${cls}">${ALERT_KIND[a.kind] || a.kind}</span></td>
-      <td>${esc(a.subject)}</td><td class="small">${esc(a.email_status || "")}</td><td><button class="btn small" data-i="${i}">查看</button></td></tr>`;
-  }).join("") || '<tr><td colspan="6" class="muted">暂无报警</td></tr>';
+    return `<tr data-row="${a.id}"><td class="col-check"><input type="checkbox" data-id="${a.id}" aria-label="选择"></td>
+      <td class="nowrap">${fmtTime(a.ts)}</td><td class="nowrap">${esc(a.model_name || "(已删除)")}</td>
+      <td><span class="badge ${cls}">${ALERT_KIND[a.kind] || a.kind}</span></td>
+      <td class="col-subject" title="${esc(a.subject)}">${esc(a.subject)}</td>
+      <td>${deliveryBadge(a.email_status)}</td><td>${deliveryBadge(a.feishu_status)}</td>
+      <td class="nowrap col-actions"><button class="btn small" data-view="${i}">查看</button><button class="btn small danger" data-del="${a.id}">删除</button></td></tr>`;
+  }).join("") || '<tr><td colspan="8" class="muted empty-row">暂无报警</td></tr>';
+  $("#alerts-clear").disabled = alertsCache.length === 0;
+  $("#alerts-check-all").disabled = alertsCache.length === 0;
+  syncAlertSelection();
 }
+async function deleteAlerts(body, confirmText) {
+  if (!confirm(confirmText)) return;
+  try {
+    await api("/api/alerts/delete", { method: "POST", body });
+  } catch (err) {
+    alert(err.message);
+  }
+  loadAlerts();
+}
+$("#alerts-body").addEventListener("change", syncAlertSelection);
+$("#alerts-check-all").addEventListener("change", (e) => {
+  $$("#alerts-body input[data-id]").forEach((b) => (b.checked = e.target.checked));
+  syncAlertSelection();
+});
+$("#alerts-delete-selected").addEventListener("click", () => {
+  const ids = selectedAlertIds();
+  if (ids.length) deleteAlerts({ ids }, `确定删除选中的 ${ids.length} 条报警记录？`);
+});
+$("#alerts-clear").addEventListener("click", () => deleteAlerts({ all: true }, "确定清空全部报警记录？此操作不可恢复。"));
 $("#alerts-body").addEventListener("click", (e) => {
-  const i = e.target.dataset.i;
-  if (i == null) return;
-  const a = alertsCache[Number(i)];
+  const { view, del } = e.target.dataset;
+  if (del != null) {
+    deleteAlerts({ ids: [Number(del)] }, "确定删除这条报警记录？");
+    return;
+  }
+  if (view == null) return;
+  const a = alertsCache[Number(view)];
   $("#alert-title").textContent = a.subject;
   $("#alert-message").textContent = a.message;
   $("#alert-dialog").showModal();
@@ -410,6 +461,13 @@ async function loadSettings() {
   smtp.smtp_password.value = "";
   smtp.smtp_password.placeholder = s.smtp_password_set ? "已保存，留空保持不变" : "未设置";
   smtp.smtp_password_clear.checked = false;
+  const fs = $("#feishu-settings-form");
+  fs.feishu_webhook.value = "";
+  fs.feishu_webhook.placeholder = s.feishu_webhook_masked ? `已保存 ${s.feishu_webhook_masked}，留空保持不变` : "https://open.feishu.cn/open-apis/bot/v2/hook/...";
+  fs.feishu_secret.value = "";
+  fs.feishu_secret.placeholder = s.feishu_secret_set ? "已保存，留空保持不变" : "未设置（机器人开启签名校验时必填）";
+  fs.feishu_webhook_clear.checked = false;
+  fs.feishu_secret_clear.checked = false;
 }
 function flash(form, text, isError) {
   const el = $(".msg", form);
@@ -450,6 +508,35 @@ $("#test-email-btn").addEventListener("click", async () => {
   try {
     await api("/api/settings/test-email", { method: "POST" });
     flash(f, "测试邮件已发送，请查收");
+  } catch (err) {
+    flash(f, err.message, true);
+  }
+});
+$("#feishu-settings-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  try {
+    await api("/api/settings", {
+      method: "PUT",
+      body: {
+        feishu_webhook: f.feishu_webhook.value.trim() || null,
+        feishu_webhook_clear: f.feishu_webhook_clear.checked,
+        feishu_secret: f.feishu_secret.value.trim() || null,
+        feishu_secret_clear: f.feishu_secret_clear.checked,
+      },
+    });
+    await loadSettings();
+    flash(f, "已保存");
+  } catch (err) {
+    flash(f, err.message, true);
+  }
+});
+$("#test-feishu-btn").addEventListener("click", async () => {
+  const f = $("#feishu-settings-form");
+  flash(f, "发送中…");
+  try {
+    await api("/api/settings/test-feishu", { method: "POST" });
+    flash(f, "测试消息已发送，请在飞书群中查看");
   } catch (err) {
     flash(f, err.message, true);
   }

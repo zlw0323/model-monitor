@@ -5,8 +5,13 @@ services:
     container_name: model-monitor
     restart: unless-stopped
     env_file: .env
+    environment:
+      # Only Caddy (fixed IP below) may set X-Forwarded-For, so the login throttle sees real client IPs.
+      - FORWARDED_ALLOW_IPS=172.30.53.10
     volumes:
       - monitor_data:/data
+    networks:
+      - monitor_net
     # Default: only reachable from the server itself (use the Caddy profile for public HTTPS access).
     # Set APP_BIND=0.0.0.0 in .env to expose plain HTTP on port 8000 directly.
     ports:
@@ -27,6 +32,15 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+    networks:
+      monitor_net:
+        ipv4_address: 172.30.53.10
+
+networks:
+  monitor_net:
+    ipam:
+      config:
+        - subnet: 172.30.53.0/24
 
 volumes:
   monitor_data:

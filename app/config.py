@@ -12,9 +12,12 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() in ("1", "true", "yes")
 APP_TZ = ZoneInfo(os.getenv("APP_TZ", "Asia/Hong_Kong"))
 
-# Probe parameters: everything else (reasoning effort, image size/quality...) is left to model defaults.
+# Probe parameters: everything else (reasoning effort, ...) is left to model defaults.
 TEXT_PROMPT = "Reply with only the word: OK"
 IMAGE_PROMPT = "A red apple on a white table"
+# Fixed so every image check does the same amount of work; "auto" defaults make generation time swing 20s~70s.
+IMAGE_QUALITY = "low"
+IMAGE_SIZE = "1024x1024"
 TEXT_MAX_TOKENS = 1024
 TEXT_TIMEOUT_SECONDS = 120
 IMAGE_TIMEOUT_SECONDS = 300
@@ -34,6 +37,8 @@ DEFAULT_SETTINGS = {
     "smtp_password_enc": "",
     "smtp_from": "",
     "smtp_to": "",
+    "feishu_webhook_enc": "",
+    "feishu_secret_enc": "",
 }
 
 
@@ -43,3 +48,5 @@ def validate() -> None:
         raise RuntimeError(f"缺少必需的环境变量: {', '.join(missing)}（参见 .env.example）")
     if len(SECRET_KEY) < 16:
         raise RuntimeError("SECRET_KEY 长度至少 16 个字符")
+    if len(ADMIN_PASSWORD) < 8:
+        raise RuntimeError("ADMIN_PASSWORD 长度至少 8 个字符")

@@ -10,7 +10,7 @@
 <body>
   <!-- 登录 -->
   <section id="login-view" class="login hidden">
-    <form id="login-form" class="card login-card">
+    <form id="login-form" method="post" action="/api/form-fallback" class="card login-card">
       <h1>模型监控平台</h1>
       <label>用户名<input name="username" autocomplete="username" required></label>
       <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
@@ -50,16 +50,24 @@
 
       <div id="tab-alerts" class="tab hidden">
         <div class="card">
-          <h2>报警记录</h2>
-          <table class="table">
-            <thead><tr><th>时间</th><th>模型</th><th>类型</th><th>标题</th><th>邮件</th><th></th></tr></thead>
+          <div class="detail-head">
+            <h2>报警记录</h2>
+            <div>
+              <button class="btn small danger" id="alerts-delete-selected" disabled>删除选中</button>
+              <button class="btn small danger" id="alerts-clear">清空全部</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+          <table class="table alerts-table">
+            <thead><tr><th class="col-check"><input type="checkbox" id="alerts-check-all" title="全选" aria-label="全选"></th><th>时间</th><th>模型</th><th>类型</th><th>标题</th><th>邮件</th><th>飞书</th><th class="col-actions">操作</th></tr></thead>
             <tbody id="alerts-body"></tbody>
           </table>
+          </div>
         </div>
       </div>
 
       <div id="tab-settings" class="tab hidden">
-        <form id="monitor-settings-form" class="card">
+        <form id="monitor-settings-form" method="post" action="/api/form-fallback" class="card">
           <h2>监控参数</h2>
           <div class="form-grid">
             <label>新模型默认检测间隔（分钟）<input name="default_interval_minutes" type="number" min="1" max="1440" required></label>
@@ -74,7 +82,7 @@
           <div class="actions"><button class="btn primary" type="submit">保存</button><span class="msg"></span></div>
         </form>
 
-        <form id="smtp-settings-form" class="card">
+        <form id="smtp-settings-form" method="post" action="/api/form-fallback" class="card">
           <h2>邮件报警（SMTP）</h2>
           <div class="form-grid">
             <label>SMTP 服务器<input name="smtp_host" placeholder="smtp.exmail.qq.com"></label>
@@ -99,6 +107,24 @@
             <span class="msg"></span>
           </div>
         </form>
+
+        <form id="feishu-settings-form" method="post" action="/api/form-fallback" class="card">
+          <h2>飞书群机器人报警</h2>
+          <div class="form-grid">
+            <label class="span2">Webhook 地址<input name="feishu_webhook" autocomplete="off" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."></label>
+            <label class="span2">签名校验密钥<input name="feishu_secret" type="password" autocomplete="new-password" placeholder="机器人安全设置 → 签名校验中复制的密钥"></label>
+          </div>
+          <div class="checks">
+            <label class="checkbox"><input type="checkbox" name="feishu_webhook_clear"> 清除已保存的 Webhook</label>
+            <label class="checkbox"><input type="checkbox" name="feishu_secret_clear"> 清除已保存的密钥</label>
+          </div>
+          <p class="muted small">与邮件报警同时发送。Webhook 和密钥均加密保存，留空则保持不变。“发送测试消息”使用已保存的配置。</p>
+          <div class="actions">
+            <button class="btn primary" type="submit">保存</button>
+            <button class="btn" type="button" id="test-feishu-btn">发送测试消息</button>
+            <span class="msg"></span>
+          </div>
+        </form>
       </div>
     </main>
   </section>
@@ -112,7 +138,7 @@
         <label>模型类型
           <select name="kind">
             <option value="text">文本 / 推理模型（流式测 TTFT）</option>
-            <option value="image">图像模型（TTFT = 完整出图耗时）</option>
+            <option value="image">图像模型（TTFT = 完整出图耗时，low / 1024x1024）</option>
           </select>
         </label>
         <label class="span2">端点 Endpoint

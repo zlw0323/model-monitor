@@ -12,6 +12,8 @@ import httpx
 from . import config
 from .crypto import decrypt
 from .db import Database
+from .feishu import FeishuNotConfigured, Notice
+from .feishu import send as send_feishu
 from .mailer import MailNotConfigured, send_mail
 from .probes import TOKEN_PARAMS, ProbeResult, probe_image, probe_text
 
@@ -19,6 +21,7 @@ log = logging.getLogger("monitor")
 
 ProbeFn = Callable[[dict[str, Any], str], Awaitable[ProbeResult]]
 MailFn = Callable[[dict[str, str], str, str], Awaitable[None]]
+FeishuFn = Callable[[dict[str, str], Notice], Awaitable[None]]
 
 KIND_LABEL = {"text": "文本/推理模型", "image": "图像模型"}
 TRIGGER_LABEL = {"schedule": "定时", "manual": "手动"}
@@ -43,11 +46,13 @@ class Monitor:
         db: Database,
         probe_fn: ProbeFn | None = None,
         mail_fn: MailFn | None = None,
+        feishu_fn: FeishuFn | None = None,
         tick_seconds: float = 5,
     ):
         self.db = db
         self._probe_override = probe_fn
         self._mail = mail_fn or send_mail
+        self._feishu = feishu_fn or send_feishu
         self._tick_seconds = tick_seconds
         self._client: httpx.AsyncClient | None = None
         self._running: dict[int, asyncio.Task] = {}
@@ -198,53 +203,70 @@ class Monitor:
             kind = "recovered"
         else:
             return
-        subject, body = self._compose(m, kind, attempts, baseline, pct, trigger)
-        alert_id = self.db.insert_alert(m["id"], kind, subject, body)
-        try:
-            await self._mail(self.db.get_settings(), subject, body)
-            status = "已发送"
-        except MailNotConfigured as e:
-            status = f"未发送：{e}"
-        except Exception as e:
-            log.exception("send alert mail failed")
-            status = f"发送失败：{type(e).__name__}: {e}"
-        self.db.set_alert_email_status(alert_id, status)
+        notice = self._compose(m, kind, attempts, baseline, pct, trigger)
+        body = render_text(notice)
+        alert_id = self.db.insert_alert(m["id"], kind, notice.title, body)
+        settings = self.db.get_settings()
+        email_status, feishu_status = await asyncio.gather(
+            _deliver("email", self._mail(settings, notice.title, body), MailNotConfigured),
+            _deliver("feishu", self._feishu(settings, notice), FeishuNotConfigured),
+        )
+        self.db.set_alert_status(alert_id, email_status, feishu_status)
 
     @staticmethod
-    def _compose(m, kind, attempts, baseline, pct, trigger) -> tuple[str, str]:
+    def _compose(m, kind, attempts, baseline, pct, trigger) -> Notice:
         name = m["name"]
         retries = len(attempts) - 1
         if kind == "down":
-            subject = f"[模型监控][报警] {name} 连通性失败"
-            verdict = f"连通性失败：首次检测及 {retries} 次重测均失败。"
+            title = f"[模型监控][报警] {name} 连通性失败"
+            summary = f"连通性失败：首次检测及 {retries} 次重测均失败。"
         elif kind == "slow":
-            subject = f"[模型监控][报警] {name} TTFT 异常"
-            verdict = f"TTFT 异常：首次检测及 {retries} 次重测均超出预警值。"
+            title = f"[模型监控][报警] {name} TTFT 异常"
+            summary = f"TTFT 异常：首次检测及 {retries} 次重测均超出预警值。"
         else:
-            subject = f"[模型监控][恢复] {name} 已恢复正常"
-            verdict = "模型已恢复正常。"
-        lines = [
-            verdict,
-            "",
-            f"模型名称：{name}",
-            f"模型类型：{KIND_LABEL.get(m['kind'], m['kind'])}",
-            f"部署名称：{m['deployment']}",
-            f"端点主机：{urlsplit(m['endpoint'] if '://' in m['endpoint'] else 'https://' + m['endpoint']).hostname}",
-            f"触发方式：{TRIGGER_LABEL.get(trigger, trigger)}检测",
+            title = f"[模型监控][恢复] {name} 已恢复正常"
+            summary = "模型已恢复正常。"
+        host = urlsplit(m["endpoint"] if "://" in m["endpoint"] else "https://" + m["endpoint"]).hostname
+        facts = [
+            ("模型名称", name),
+            ("模型类型", KIND_LABEL.get(m["kind"], m["kind"])),
+            ("部署名称", m["deployment"]),
+            ("触发方式", f"{TRIGGER_LABEL.get(trigger, trigger)}检测"),
+            ("端点主机", host or "-"),
         ]
         if baseline:
-            lines.append(f"TTFT 基线：{baseline:.0f} ms，预警阈值：+{pct:g}%（> {baseline * (1 + pct / 100):.0f} ms）")
+            facts.append(("TTFT 基线", f"{baseline:.0f} ms，预警 +{pct:g}%（> {baseline * (1 + pct / 100):.0f} ms）"))
         else:
-            lines.append("TTFT 基线：样本不足，尚未启用 TTFT 预警")
-        lines += ["", "检测明细："]
+            facts.append(("TTFT 基线", "样本不足，尚未启用 TTFT 预警"))
+        details = []
         for i, (r, v, ts) in enumerate(attempts):
             label = "首次检测" if i == 0 else f"第 {i} 次重测"
             state = {"ok": "正常", "slow": "TTFT 超标", "down": "失败"}[v]
             ttft = f"{r.ttft_ms:.0f} ms" if r.ttft_ms is not None else "-"
             http = r.http_status if r.http_status is not None else "-"
-            line = f"  [{fmt_ts(ts)}] {label}：{state}，TTFT={ttft}，HTTP={http}"
+            line = f"[{fmt_ts(ts)}] {label}：{state}，TTFT={ttft}，HTTP={http}"
             if r.error:
                 line += f"，错误：{r.error}"
-            lines.append(line)
-        lines += ["", f"时区：{config.APP_TZ.key}"]
-        return subject, "\n".join(lines)
+            details.append(line)
+        return Notice(kind, title, summary, facts, details, f"时区：{config.APP_TZ.key}")
+
+
+def render_text(n: Notice) -> str:
+    lines = [n.summary, ""]
+    lines += [f"{k}：{v}" for k, v in n.facts]
+    if n.details:
+        lines += ["", "检测明细："] + [f"  {d}" for d in n.details]
+    if n.footer:
+        lines += ["", n.footer]
+    return "\n".join(lines)
+
+
+async def _deliver(channel: str, coro: Awaitable[None], not_configured: type[Exception]) -> str:
+    try:
+        await coro
+        return "已发送"
+    except not_configured as e:
+        return f"未发送：{e}"
+    except Exception as e:
+        log.exception("send alert via %s failed", channel)
+        return f"发送失败：{type(e).__name__}: {e}"

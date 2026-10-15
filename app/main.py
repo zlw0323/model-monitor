@@ -1,3 +1,4 @@
+import hashlib
 import hmac
 import logging
 import time
@@ -7,7 +8,7 @@ from typing import Any, Callable, Literal
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from starlette.middleware.sessions import SessionMiddleware
@@ -15,12 +16,26 @@ from starlette.middleware.sessions import SessionMiddleware
 from . import config
 from .crypto import decrypt, encrypt, mask
 from .db import Database
+from .feishu import FeishuNotConfigured, Notice, is_webhook_url, mask_webhook
+from .feishu import send as send_feishu
 from .mailer import MailNotConfigured, send_mail
 from .monitor import Monitor
 from .probes import build_url, deployment_from_endpoint
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+# httpx logs every request URL at INFO, which would print the Feishu webhook token into container logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 STATIC_DIR = Path(__file__).parent / "static"
+SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
+        "object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+}
 
 INT_SETTINGS = {
     "default_interval_minutes": (1, 1440),
@@ -69,6 +84,19 @@ class SettingsIn(BaseModel):
     values: dict[str, Any] = {}
     smtp_password: str | None = None
     smtp_password_clear: bool = False
+    feishu_webhook: str | None = Field(None, max_length=500)
+    feishu_webhook_clear: bool = False
+    feishu_secret: str | None = Field(None, max_length=200)
+    feishu_secret_clear: bool = False
+
+
+class AlertDeleteIn(BaseModel):
+    ids: list[int] = Field(default_factory=list, max_length=1000)
+    all: bool = False
+
+
+def _host(endpoint: str) -> str:
+    return (urlsplit(endpoint if "://" in endpoint else "https://" + endpoint).hostname or "").lower()
 
 
 class _LoginThrottle:
@@ -125,9 +153,15 @@ def create_app(
     def mon_dep(request: Request) -> Monitor:
         return request.app.state.monitor
 
+    def credential_fingerprint() -> str:
+        # Changing ADMIN_USERNAME/ADMIN_PASSWORD invalidates every existing session.
+        msg = f"{config.ADMIN_USERNAME}\n{config.ADMIN_PASSWORD}".encode()
+        return hmac.new(config.SECRET_KEY.encode(), msg, hashlib.sha256).hexdigest()[:32]
+
     def require_login(request: Request) -> str:
         user = request.session.get("user")
-        if not user:
+        fp = request.session.get("fp", "")
+        if not user or not hmac.compare_digest(str(fp), credential_fingerprint()):
             raise HTTPException(401, "未登录")
         return user
 
@@ -142,7 +176,9 @@ def create_app(
             throttle.fail(ip)
             raise HTTPException(401, "用户名或密码错误")
         throttle.ok(ip)
+        request.session.clear()
         request.session["user"] = body.username
+        request.session["fp"] = credential_fingerprint()
         return {"user": body.username}
 
     @app.post("/api/logout")
@@ -258,6 +294,9 @@ def create_app(
         }
         if body.api_key:
             fields["api_key_enc"] = encrypt(body.api_key)
+        elif _host(old["endpoint"]) != _host(body.endpoint):
+            # Otherwise anyone holding a session could redirect the stored key to a host they control.
+            raise HTTPException(422, "端点主机已变更，请重新填写 API Key")
         target_changed = any(old[k] != fields[k] for k in ("kind", "endpoint", "deployment"))
         if target_changed:
             # A different target makes the learned baseline and token-param detection meaningless.
@@ -303,11 +342,28 @@ def create_app(
     def list_alerts(limit: int = 200, _: str = Depends(require_login), db: Database = Depends(db_dep)):
         return db.list_alerts(min(max(limit, 1), 1000))
 
+    @app.post("/api/alerts/delete")
+    def delete_alerts(body: AlertDeleteIn, _: str = Depends(require_login), db: Database = Depends(db_dep)):
+        if not body.all and not body.ids:
+            raise HTTPException(422, "请选择要删除的报警记录")
+        return {"deleted": db.delete_alerts(None if body.all else body.ids)}
+
     # ---- settings ----
     def public_settings(db: Database) -> dict:
         s = db.get_settings()
         pw = s.pop("smtp_password_enc", "")
-        return {**s, "smtp_password_set": bool(pw)}
+        hook = s.pop("feishu_webhook_enc", "")
+        secret = s.pop("feishu_secret_enc", "")
+        try:
+            hook_masked = mask_webhook(decrypt(hook))
+        except RuntimeError:
+            hook_masked = "（无法解密，请重新填写）"
+        return {
+            **s,
+            "smtp_password_set": bool(pw),
+            "feishu_webhook_masked": hook_masked,
+            "feishu_secret_set": bool(secret),
+        }
 
     @app.get("/api/settings")
     def get_settings(_: str = Depends(require_login), db: Database = Depends(db_dep)):
@@ -343,10 +399,33 @@ def create_app(
                 out[k] = v
             else:
                 raise HTTPException(422, f"未知设置项: {k}")
+        current = db.get_settings()
+        smtp_target_changed = any(
+            k in out and out[k] != current.get(k, "") for k in ("smtp_host", "smtp_port", "smtp_security")
+        )
+        if (
+            smtp_target_changed
+            and current.get("smtp_password_enc")
+            and not body.smtp_password
+            and not body.smtp_password_clear
+        ):
+            # Same reason as model endpoints: never send the stored password to a newly entered server.
+            raise HTTPException(422, "SMTP 服务器、端口或加密方式已变更，请重新填写密码")
         if body.smtp_password_clear:
             out["smtp_password_enc"] = ""
         elif body.smtp_password:
             out["smtp_password_enc"] = encrypt(body.smtp_password)
+        if body.feishu_webhook_clear:
+            out["feishu_webhook_enc"] = ""
+        elif body.feishu_webhook:
+            hook = body.feishu_webhook.strip()
+            if not is_webhook_url(hook):
+                raise HTTPException(422, "飞书 Webhook 地址格式不正确，应形如 https://open.feishu.cn/open-apis/bot/v2/hook/xxx")
+            out["feishu_webhook_enc"] = encrypt(hook)
+        if body.feishu_secret_clear:
+            out["feishu_secret_enc"] = ""
+        elif body.feishu_secret:
+            out["feishu_secret_enc"] = encrypt(body.feishu_secret.strip())
         db.set_settings(out)
         return public_settings(db)
 
@@ -364,12 +443,49 @@ def create_app(
             raise HTTPException(502, f"发送失败：{type(e).__name__}: {e}")
         return {"ok": True}
 
+    @app.post("/api/settings/test-feishu")
+    async def test_feishu(_: str = Depends(require_login), db: Database = Depends(db_dep)):
+        notice = Notice(
+            "test",
+            "[模型监控] 测试消息",
+            "这是一条来自模型监控平台的测试消息。收到说明飞书 Webhook 和签名配置正确。",
+            footer=f"时区：{config.APP_TZ.key}",
+        )
+        try:
+            await send_feishu(db.get_settings(), notice)
+        except FeishuNotConfigured as e:
+            raise HTTPException(400, str(e))
+        except Exception as e:
+            raise HTTPException(502, f"发送失败：{type(e).__name__}: {e}")
+        return {"ok": True}
+
     # ---- frontend ----
+    @app.middleware("http")
+    async def no_stale_assets(request: Request, call_next):
+        response = await call_next(request)
+        # Force revalidation so browsers never run an outdated app.js after an upgrade.
+        if request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"
+        for k, v in SECURITY_HEADERS.items():
+            response.headers.setdefault(k, v)
+        return response
+
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+    def asset_version(name: str) -> str:
+        return hashlib.md5((STATIC_DIR / name).read_bytes()).hexdigest()[:10]
 
     @app.get("/", include_in_schema=False)
     def index():
-        return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        for name in ("app.js", "style.css"):
+            html = html.replace(f"/static/{name}", f"/static/{name}?v={asset_version(name)}")
+        return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
+
+    @app.post("/api/form-fallback", include_in_schema=False)
+    def form_fallback():
+        # Only reached if the page script failed to load; the form body is discarded, never stored or logged.
+        return RedirectResponse("/", status_code=303)
 
     @app.get("/healthz", include_in_schema=False)
     def healthz():

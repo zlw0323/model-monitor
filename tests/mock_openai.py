@@ -9,6 +9,9 @@ Behaviour is selected by the `model` (deployment) name:
   down        always HTTP 503
   flaky       fails every other request
   image       images endpoint, ~1 s
+
+Also a fake Feishu bot at /open-apis/bot/v2/hook/<any> (signature secret "test-secret");
+received messages are listed at GET /feishu-messages.
 """
 
 import asyncio
@@ -57,3 +60,31 @@ async def chat(req: Request):
 async def images(req: Request):
     await asyncio.sleep(1)
     return {"data": [{"b64_json": "aGVsbG8="}]}
+
+
+# ---- Fake Feishu custom bot: verifies the signature with secret "test-secret" and records messages ----
+FEISHU_SECRET = "test-secret"
+feishu_messages: list[dict] = []
+
+
+@app.post("/open-apis/bot/v2/hook/{token}")
+async def feishu_hook(token: str, req: Request):
+    import base64
+    import hashlib
+    import hmac
+    import time
+
+    body = await req.json()
+    ts = int(body.get("timestamp", 0))
+    expected = base64.b64encode(
+        hmac.new(f"{ts}\n{FEISHU_SECRET}".encode(), digestmod=hashlib.sha256).digest()
+    ).decode()
+    if body.get("sign") != expected or abs(time.time() - ts) > 3600:
+        return {"code": 19021, "msg": "sign match fail or timestamp is not within one hour from current time"}
+    feishu_messages.append(body)
+    return {"code": 0, "msg": "success", "data": {}}
+
+
+@app.get("/feishu-messages")
+async def list_feishu_messages():
+    return feishu_messages

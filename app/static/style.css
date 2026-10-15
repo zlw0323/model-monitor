@@ -28,6 +28,19 @@ code { background: #f3f4f6; padding: 1px 4px; border-radius: 4px; font-size: 12p
 .btn.danger { color: var(--bad); }
 .btn.ghost { background: transparent; color: #fff; border-color: rgba(255,255,255,.4); }
 .btn.small { padding: 3px 10px; font-size: 12px; }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.col-check { width: 36px; text-align: center !important; }
+.col-check input { width: 16px; height: 16px; margin: 0; cursor: pointer; vertical-align: middle; }
+.nowrap { white-space: nowrap; }
+.checks { display: flex; gap: 20px; flex-wrap: wrap; }
+.table-wrap { overflow-x: auto; }
+.alerts-table td { vertical-align: middle; }
+.alerts-table tbody tr:hover { background: #f9fafb; }
+.alerts-table tbody tr.selected { background: #eff6ff; }
+.alerts-table .col-subject { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.alerts-table .col-actions { text-align: right; }
+.alerts-table .col-actions .btn + .btn { margin-left: 6px; }
+.empty-row { text-align: center !important; padding: 24px !important; }
 
 input, select { width: 100%; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; font-size: 14px; background: #fff; }
 label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: #374151; }
