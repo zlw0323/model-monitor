@@ -103,6 +103,7 @@ function route() {
     state.timer = setInterval(loadDashboard, 15000);
   } else if (valid === "alerts") {
     loadAlerts();
+    state.timer = setInterval(loadAlerts, 15000);
   } else {
     loadSettings();
   }
@@ -395,13 +396,16 @@ function deliveryBadge(status) {
   if (!status) return '<span class="badge muted">-</span>';
   const s = String(status);
   const [cls, label] = s.startsWith("已发送") ? ["ok", "已发送"]
+    : s.startsWith("已补发") ? ["ok", "已补发"]
     : s.startsWith("未发送") ? ["muted", "未配置"]
     : s.startsWith("发送中") ? ["info", "发送中"]
+    : s.includes("将自动重试") ? ["warn", "待重试"]
     : ["bad", "失败"];
   return `<span class="badge ${cls}" title="${esc(s)}">${label}</span>`;
 }
 async function loadAlerts() {
-  alertsCache = await api("/api/alerts").catch(() => []);
+  const keep = new Set(selectedAlertIds());
+  alertsCache = await api("/api/alerts").catch(() => alertsCache);
   $("#alerts-body").innerHTML = alertsCache.map((a, i) => {
     const cls = a.kind === "recovered" ? "ok" : a.kind === "slow" ? "warn" : "bad";
     return `<tr data-row="${a.id}"><td class="col-check"><input type="checkbox" data-id="${a.id}" aria-label="选择"></td>
@@ -411,6 +415,7 @@ async function loadAlerts() {
       <td>${deliveryBadge(a.email_status)}</td><td>${deliveryBadge(a.feishu_status)}</td>
       <td class="nowrap col-actions"><button class="btn small" data-view="${i}">查看</button><button class="btn small danger" data-del="${a.id}">删除</button></td></tr>`;
   }).join("") || '<tr><td colspan="8" class="muted empty-row">暂无报警</td></tr>';
+  $$("#alerts-body input[data-id]").forEach((b) => (b.checked = keep.has(Number(b.dataset.id))));
   $("#alerts-clear").disabled = alertsCache.length === 0;
   $("#alerts-check-all").disabled = alertsCache.length === 0;
   syncAlertSelection();

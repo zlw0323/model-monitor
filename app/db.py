@@ -50,7 +50,12 @@ CREATE TABLE IF NOT EXISTS alerts (
     subject TEXT NOT NULL,
     message TEXT NOT NULL,
     email_status TEXT,
-    feishu_status TEXT
+    feishu_status TEXT,
+    notice_json TEXT,
+    email_tries INTEGER NOT NULL DEFAULT 0,
+    email_retry_at REAL,
+    feishu_tries INTEGER NOT NULL DEFAULT 0,
+    feishu_retry_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts);
 CREATE TABLE IF NOT EXISTS settings (
@@ -71,8 +76,16 @@ class Database:
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(SCHEMA)
             cols = {r[1] for r in self._conn.execute("PRAGMA table_info(alerts)")}
-            if "feishu_status" not in cols:
-                self._conn.execute("ALTER TABLE alerts ADD COLUMN feishu_status TEXT")
+            for col, ddl in (
+                ("feishu_status", "TEXT"),
+                ("notice_json", "TEXT"),
+                ("email_tries", "INTEGER NOT NULL DEFAULT 0"),
+                ("email_retry_at", "REAL"),
+                ("feishu_tries", "INTEGER NOT NULL DEFAULT 0"),
+                ("feishu_retry_at", "REAL"),
+            ):
+                if col not in cols:
+                    self._conn.execute(f"ALTER TABLE alerts ADD COLUMN {col} {ddl}")
             for k, v in DEFAULT_SETTINGS.items():
                 self._conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (k, v))
 
@@ -177,18 +190,42 @@ class Database:
         self.execute("DELETE FROM alerts WHERE ts < ?", (cutoff,))
 
     # ---- alerts ----
-    def insert_alert(self, model_id: int, kind: str, subject: str, message: str) -> int:
+    def insert_alert(self, model_id: int | None, kind: str, subject: str, message: str, notice_json: str = "") -> int:
         cur = self.execute(
-            "INSERT INTO alerts (model_id, ts, kind, subject, message, email_status, feishu_status) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (model_id, time.time(), kind, subject, message, "发送中", "发送中"),
+            "INSERT INTO alerts (model_id, ts, kind, subject, message, email_status, feishu_status, notice_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (model_id, time.time(), kind, subject, message, "发送中", "发送中", notice_json or None),
         )
         return int(cur.lastrowid)
 
+    def get_alert(self, alert_id: int) -> dict[str, Any] | None:
+        return self.one("SELECT * FROM alerts WHERE id = ?", (alert_id,))
+
+    def update_alert(self, alert_id: int, fields: dict[str, Any]) -> None:
+        if not fields:
+            return
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        self.execute(f"UPDATE alerts SET {sets} WHERE id = ?", (*fields.values(), alert_id))
+
     def set_alert_status(self, alert_id: int, email_status: str, feishu_status: str) -> None:
-        self.execute(
-            "UPDATE alerts SET email_status = ?, feishu_status = ? WHERE id = ?", (email_status, feishu_status, alert_id)
+        self.update_alert(alert_id, {"email_status": email_status, "feishu_status": feishu_status})
+
+    def due_alert_retries(self, now: float) -> list[dict[str, Any]]:
+        return self.all(
+            "SELECT * FROM alerts WHERE email_retry_at <= ? OR feishu_retry_at <= ? ORDER BY ts, id", (now, now)
         )
+
+    def pending_alerts(self, model_id: int, exclude_id: int) -> list[dict[str, Any]]:
+        return self.all(
+            "SELECT * FROM alerts WHERE model_id = ? AND id != ? "
+            "AND (email_retry_at IS NOT NULL OR feishu_retry_at IS NOT NULL) ORDER BY ts, id",
+            (model_id, exclude_id),
+        )
+
+    def expedite_retries(self, channel: str, now: float) -> None:
+        """Channel works again: make every pending retry on it due immediately."""
+        col = {"email": "email_retry_at", "feishu": "feishu_retry_at"}[channel]
+        self.execute(f"UPDATE alerts SET {col} = ? WHERE {col} > ?", (now, now))
 
     def delete_alerts(self, ids: list[int] | None) -> int:
         """Delete the given alerts, or all alerts when ids is None."""
@@ -201,7 +238,8 @@ class Database:
 
     def list_alerts(self, limit: int = 200) -> list[dict[str, Any]]:
         return self.all(
-            "SELECT a.*, m.name AS model_name FROM alerts a LEFT JOIN models m ON m.id = a.model_id "
+            "SELECT a.id, a.model_id, a.ts, a.kind, a.subject, a.message, a.email_status, a.feishu_status, "
+            "m.name AS model_name FROM alerts a LEFT JOIN models m ON m.id = a.model_id "
             "ORDER BY a.ts DESC, a.id DESC LIMIT ?",
             (limit,),
         )

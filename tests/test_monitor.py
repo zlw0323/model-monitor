@@ -3,6 +3,7 @@ import time
 
 from app.crypto import encrypt
 from app.db import Database
+from app.feishu import FeishuNotConfigured
 from app.mailer import MailNotConfigured
 from app.monitor import Monitor
 from app.probes import ProbeResult
@@ -142,6 +143,75 @@ def test_mail_not_configured_is_recorded(tmp_path):
     a = h.db.list_alerts()[0]
     assert a["email_status"].startswith("未发送")
     assert a["feishu_status"].startswith("发送失败") and "boom" in a["feishu_status"]
+
+
+def test_failed_feishu_alert_is_resent_before_recovery(tmp_path):
+    h = Harness(tmp_path)
+    network = {"up": False}
+
+    async def flaky_feishu(settings, notice):
+        if not network["up"]:
+            raise ConnectionError("All connection attempts failed")
+        h.notices.append(notice)
+
+    h.monitor._feishu = flaky_feishu
+    h.cycle(fail(), fail(), fail(), fail())
+    a = h.db.list_alerts()[0]
+    assert "将自动重试" in a["feishu_status"] and a["email_status"] == "已发送"
+    raw = h.db.get_alert(a["id"])
+    assert raw["feishu_retry_at"] > time.time() + 20 and raw["email_retry_at"] is None
+
+    # Network back: the recovery cycle first re-sends the missed "down" alert, then sends "recovered".
+    network["up"] = True
+    h.cycle(ok(500))
+    assert [n.kind for n in h.notices] == ["down", "recovered"]
+    assert h.notices[0].title.startswith("[补发]") and "原报警时间" in h.notices[0].summary
+    statuses = {x["kind"]: x["feishu_status"] for x in h.db.list_alerts()}
+    assert statuses == {"down": "已补发", "recovered": "已发送"}
+    # Email was delivered the first time and must not be sent twice.
+    assert len(h.mails) == 2
+
+
+def test_background_retry_and_give_up(tmp_path):
+    h = Harness(tmp_path)
+    attempts = []
+
+    async def broken_feishu(settings, notice):
+        attempts.append(notice.title)
+        raise ConnectionError("down")
+
+    h.monitor._feishu = broken_feishu
+    h.cycle(fail(), fail(), fail(), fail())
+    alert_id = h.db.list_alerts()[0]["id"]
+
+    # Not due yet: the worker does nothing.
+    asyncio.run(h.monitor.retry_due_alerts())
+    assert len(attempts) == 1
+
+    # Make it due; still failing -> tries increments and a later retry is scheduled.
+    h.db.update_alert(alert_id, {"feishu_retry_at": time.time() - 1})
+    asyncio.run(h.monitor.retry_due_alerts())
+    a = h.db.get_alert(alert_id)
+    assert len(attempts) == 2 and attempts[1].startswith("[补发]")
+    assert a["feishu_tries"] == 2 and a["feishu_retry_at"] > time.time()
+
+    # Older than 24h -> give up.
+    h.db.update_alert(alert_id, {"ts": time.time() - 25 * 3600, "feishu_retry_at": time.time() - 1})
+    asyncio.run(h.monitor.retry_due_alerts())
+    a = h.db.get_alert(alert_id)
+    assert a["feishu_retry_at"] is None and "放弃" in a["feishu_status"]
+
+
+def test_not_configured_is_not_retried(tmp_path):
+    h = Harness(tmp_path)
+
+    async def no_feishu(settings, notice):
+        raise FeishuNotConfigured("未配置飞书 Webhook")
+
+    h.monitor._feishu = no_feishu
+    h.cycle(fail(), fail(), fail(), fail())
+    a = h.db.get_alert(h.db.list_alerts()[0]["id"])
+    assert a["feishu_status"].startswith("未发送") and a["feishu_retry_at"] is None
 
 
 def test_scheduler_trigger_sets_next_run(tmp_path):

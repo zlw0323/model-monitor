@@ -3,6 +3,7 @@ import logging
 import sqlite3
 import time
 import uuid
+from dataclasses import replace
 from datetime import datetime
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit
@@ -25,6 +26,10 @@ FeishuFn = Callable[[dict[str, str], Notice], Awaitable[None]]
 
 KIND_LABEL = {"text": "文本/推理模型", "image": "图像模型"}
 TRIGGER_LABEL = {"schedule": "定时", "manual": "手动"}
+CHANNELS = ("email", "feishu")
+# Delay before each retry of a failed alert delivery; the last value repeats until we give up.
+RETRY_BACKOFF = (30, 60, 120, 300, 600)
+RETRY_GIVE_UP_SECONDS = 24 * 3600
 
 
 def fmt_ts(ts: float) -> str:
@@ -57,6 +62,8 @@ class Monitor:
         self._client: httpx.AsyncClient | None = None
         self._running: dict[int, asyncio.Task] = {}
         self._loop_task: asyncio.Task | None = None
+        self._retry_task: asyncio.Task | None = None
+        self._send_lock = asyncio.Lock()
         self._last_purge = 0.0
 
     # ---- lifecycle ----
@@ -65,7 +72,7 @@ class Monitor:
         self._loop_task = asyncio.create_task(self._loop())
 
     async def stop(self) -> None:
-        tasks = [t for t in (self._loop_task, *self._running.values()) if t]
+        tasks = [t for t in (self._loop_task, self._retry_task, *self._running.values()) if t]
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -84,6 +91,8 @@ class Monitor:
         now = time.time()
         for m in self.db.due_models(now):
             self.trigger(m["id"], "schedule")
+        if (self._retry_task is None or self._retry_task.done()) and self.db.due_alert_retries(now):
+            self._retry_task = asyncio.create_task(self.retry_due_alerts())
         if now - self._last_purge > 3600:
             self._last_purge = now
             days = int(self.db.get_settings().get("retention_days") or 90)
@@ -204,14 +213,75 @@ class Monitor:
         else:
             return
         notice = self._compose(m, kind, attempts, baseline, pct, trigger)
-        body = render_text(notice)
-        alert_id = self.db.insert_alert(m["id"], kind, notice.title, body)
-        settings = self.db.get_settings()
-        email_status, feishu_status = await asyncio.gather(
-            _deliver("email", self._mail(settings, notice.title, body), MailNotConfigured),
-            _deliver("feishu", self._feishu(settings, notice), FeishuNotConfigured),
-        )
-        self.db.set_alert_status(alert_id, email_status, feishu_status)
+        alert_id = self.db.insert_alert(m["id"], kind, notice.title, render_text(notice), notice.to_json())
+        # Earlier alerts for this model that failed to send go out first, so "down" never arrives after "recovered".
+        for pending in self.db.pending_alerts(m["id"], alert_id):
+            channels = [ch for ch in CHANNELS if pending[f"{ch}_retry_at"] is not None]
+            await self.deliver_alert(pending["id"], channels, resend=True)
+        await self.deliver_alert(alert_id, list(CHANNELS), resend=False)
+
+    async def retry_due_alerts(self) -> None:
+        try:
+            now = time.time()
+            for a in self.db.due_alert_retries(now):
+                channels = [ch for ch in CHANNELS if a[f"{ch}_retry_at"] is not None and a[f"{ch}_retry_at"] <= now]
+                await self.deliver_alert(a["id"], channels, resend=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("alert retry failed")
+
+    async def deliver_alert(self, alert_id: int, channels: list[str], resend: bool) -> None:
+        async with self._send_lock:
+            a = self.db.get_alert(alert_id)
+            if a and resend:
+                # Another task may have delivered it while we waited for the lock.
+                channels = [ch for ch in channels if a[f"{ch}_retry_at"] is not None]
+            if not a or not channels:
+                return
+            if not a.get("notice_json"):
+                # Rows created before retry support: nothing to resend.
+                self.db.update_alert(alert_id, {f"{ch}_retry_at": None for ch in channels})
+                return
+            notice = Notice.from_json(a["notice_json"])
+            if resend:
+                notice = replace(
+                    notice,
+                    title=f"[补发] {notice.title}",
+                    summary=f"{notice.summary}\n（原报警时间 {fmt_ts(a['ts'])}，当时发送失败，现补发）",
+                )
+            body = render_text(notice)
+            settings = self.db.get_settings()
+            senders = {
+                "email": lambda: self._mail(settings, notice.title, body),
+                "feishu": lambda: self._feishu(settings, notice),
+            }
+            not_configured = {"email": MailNotConfigured, "feishu": FeishuNotConfigured}
+            results = await asyncio.gather(*(_attempt(ch, senders[ch], not_configured[ch]) for ch in channels))
+
+            now = time.time()
+            fields: dict[str, Any] = {}
+            for ch, (outcome, err) in zip(channels, results):
+                tries = (a.get(f"{ch}_tries") or 0) + 1
+                fields[f"{ch}_tries"] = tries
+                if outcome == "sent":
+                    fields[f"{ch}_status"] = "已补发" if resend else "已发送"
+                    fields[f"{ch}_retry_at"] = None
+                elif outcome == "not_configured":
+                    fields[f"{ch}_status"] = f"未发送：{err}"
+                    fields[f"{ch}_retry_at"] = None
+                else:
+                    delay = RETRY_BACKOFF[min(tries - 1, len(RETRY_BACKOFF) - 1)]
+                    if now + delay - a["ts"] > RETRY_GIVE_UP_SECONDS:
+                        fields[f"{ch}_status"] = f"发送失败（已重试 {tries} 次，放弃）：{err}"
+                        fields[f"{ch}_retry_at"] = None
+                    else:
+                        fields[f"{ch}_status"] = f"发送失败，将自动重试（已尝试 {tries} 次）：{err}"
+                        fields[f"{ch}_retry_at"] = now + delay
+            self.db.update_alert(alert_id, fields)
+            for ch, (outcome, _) in zip(channels, results):
+                if outcome == "sent":
+                    self.db.expedite_retries(ch, now)
 
     @staticmethod
     def _compose(m, kind, attempts, baseline, pct, trigger) -> Notice:
@@ -261,12 +331,15 @@ def render_text(n: Notice) -> str:
     return "\n".join(lines)
 
 
-async def _deliver(channel: str, coro: Awaitable[None], not_configured: type[Exception]) -> str:
+async def _attempt(
+    channel: str, send: Callable[[], Awaitable[None]], not_configured: type[Exception]
+) -> tuple[str, str]:
+    """Returns ('sent' | 'not_configured' | 'failed', message)."""
     try:
-        await coro
-        return "已发送"
+        await send()
+        return "sent", ""
     except not_configured as e:
-        return f"未发送：{e}"
+        return "not_configured", str(e)
     except Exception as e:
-        log.exception("send alert via %s failed", channel)
-        return f"发送失败：{type(e).__name__}: {e}"
+        log.warning("send alert via %s failed: %s: %s", channel, type(e).__name__, e)
+        return "failed", f"{type(e).__name__}: {e}"

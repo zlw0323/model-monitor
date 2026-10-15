@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from urllib.parse import urlsplit
 
 import httpx
@@ -34,6 +34,15 @@ class Notice:
     facts: list[tuple[str, str]] = field(default_factory=list)
     details: list[str] = field(default_factory=list)
     footer: str = ""
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), ensure_ascii=False)
+
+    @classmethod
+    def from_json(cls, raw: str) -> "Notice":
+        d = json.loads(raw)
+        d["facts"] = [tuple(x) for x in d.get("facts", [])]
+        return cls(**d)
 
 
 FEISHU_HOSTS = {"open.feishu.cn", "open.larksuite.com"}
