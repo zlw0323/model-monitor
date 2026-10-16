@@ -188,7 +188,7 @@ function renderGrid(models) {
           <div class="muted small">${KIND[m.kind]} · ${esc(m.deployment)}</div>
         </div>
         <div class="badges">
-          ${m.running ? '<span class="badge info">检测中…</span>' : ""}
+          ${m.queued ? '<span class="badge muted" title="等待其他检测完成（并发上限或独占重测）">排队中…</span>' : m.running ? '<span class="badge info">检测中…</span>' : ""}
           ${m.enabled ? `<span class="badge ${st.cls}">${st.label}</span>` : '<span class="badge muted">已停用</span>'}
         </div>
       </div>
@@ -245,7 +245,7 @@ function chartConfig(m, checks, big) {
             label: (item) => {
               const c = item.raw.c;
               if (!c) return `${item.dataset.label}: ${fmtMs(item.raw.y)}`;
-              const tag = c.attempt ? `第${c.attempt}次重测` : "首次";
+              const tag = (c.attempt ? `第${c.attempt}次重测` : "首次") + (c.exclusive ? "·独占" : "") + (c.interfered ? "·受干扰" : "");
               return c.success ? `${tag} TTFT ${fmtMs(c.ttft_ms)}` : `${tag} 失败: ${(c.error || "").slice(0, 80)}`;
             },
           },
@@ -316,9 +316,13 @@ async function refreshDetail() {
   const trig = { schedule: "定时", manual: "手动" };
   $("#detail-body").innerHTML = [...checks].reverse().slice(0, 300).map((c) => {
     const res = !c.success ? '<span class="badge bad">失败</span>' : c.anomaly ? '<span class="badge warn">超标</span>' : '<span class="badge ok">正常</span>';
-    return `<tr><td>${fmtTime(c.ts)}</td><td>${trig[c.trigger] || c.trigger}</td><td>${c.attempt ? `重测 ${c.attempt}` : "首次"}</td><td>${res}</td>
-      <td>${fmtMs(c.ttft_ms)}</td><td>${fmtMs(c.total_ms)}</td><td>${c.http_status ?? "-"}</td><td class="err-cell" title="${esc(c.error)}">${esc(c.error || "")}</td></tr>`;
-  }).join("") || '<tr><td colspan="8" class="muted">暂无数据</td></tr>';
+    const round = (c.attempt ? `重测 ${c.attempt}` : "首次") + (c.exclusive ? ' <span class="badge info" title="暂停其他检测后单独测量">独占</span>' : "");
+    const conc = c.concurrent == null ? "-"
+      : c.interfered ? `<span class="badge warn" title="与图像检测同时进行，不计入基线">${c.concurrent} · 受干扰</span>`
+      : String(c.concurrent);
+    return `<tr><td>${fmtTime(c.ts)}</td><td>${trig[c.trigger] || c.trigger}</td><td>${round}</td><td>${res}</td>
+      <td>${fmtMs(c.ttft_ms)}</td><td>${fmtMs(c.total_ms)}</td><td>${conc}</td><td>${c.http_status ?? "-"}</td><td class="err-cell" title="${esc(c.error)}">${esc(c.error || "")}</td></tr>`;
+  }).join("") || '<tr><td colspan="9" class="muted">暂无数据</td></tr>';
 }
 $("#detail-close").addEventListener("click", () => {
   $("#detail-dialog").close();

@@ -21,6 +21,7 @@ from .feishu import send as send_feishu
 from .mailer import MailNotConfigured, send_mail
 from .monitor import Monitor
 from .probes import build_url, deployment_from_endpoint
+from .scheduling import next_slot
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 # httpx logs every request URL at INFO, which would print the Feishu webhook token into container logs.
@@ -45,6 +46,9 @@ INT_SETTINGS = {
     "retry_gap_seconds": (0, 600),
     "retention_days": (1, 3650),
     "smtp_port": (1, 65535),
+    "max_concurrent_text": (1, 50),
+    "max_concurrent_image": (1, 50),
+    "max_concurrent_per_host": (1, 50),
 }
 FLOAT_SETTINGS = {"ttft_threshold_pct": (1, 10000)}
 TEXT_SETTINGS = ("smtp_host", "smtp_username", "smtp_from", "smtp_to")
@@ -225,6 +229,7 @@ def create_app(
             "token_param": m["token_param"],
             "status": m["status"],
             "running": monitor.is_running(m["id"]),
+            "queued": monitor.is_queued(m["id"]),
             "last_check_at": m["last_check_at"],
             "next_run_at": m["next_run_at"] if m["enabled"] else None,
             "latest": latest,
@@ -304,9 +309,7 @@ def create_app(
         if target_changed or body.api_key or (body.enabled and not old["enabled"]):
             fields["next_run_at"] = time.time()
         elif body.interval_minutes != old["interval_minutes"]:
-            fields["next_run_at"] = min(
-                old["next_run_at"] or time.time(), (old["last_check_at"] or time.time()) + body.interval_minutes * 60
-            )
+            fields["next_run_at"] = next_slot(model_id, body.interval_minutes, time.time())
         db.update_model(model_id, fields)
         return serialize(db.get_model(model_id), db, mon, db.get_settings())
 

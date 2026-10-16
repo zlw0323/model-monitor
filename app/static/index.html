@@ -77,8 +77,11 @@
             <label>异常后重测次数<input name="retry_count" type="number" min="0" max="10" required></label>
             <label>重测间隔（秒）<input name="retry_gap_seconds" type="number" min="0" max="600" required></label>
             <label>历史数据保留（天）<input name="retention_days" type="number" min="1" required></label>
+            <label>文本模型最多同时检测数<input name="max_concurrent_text" type="number" min="1" max="50" required></label>
+            <label>图像模型最多同时检测数<input name="max_concurrent_image" type="number" min="1" max="50" required></label>
+            <label>同一 Azure 资源最多同时检测数<input name="max_concurrent_per_host" type="number" min="1" max="50" required></label>
           </div>
-          <p class="muted">单个模型可以在编辑页覆盖阈值、设置手动基线。</p>
+          <p class="muted">各模型的检测时间会在检测间隔内自动错开。与图像检测同时进行的样本标记为“受干扰”，不计入基线；TTFT 超标时的重测会暂停其他检测、单独进行。单个模型可以在编辑页覆盖阈值、设置手动基线。</p>
           <div class="actions"><button class="btn primary" type="submit">保存</button><span class="msg"></span></div>
         </form>
 
@@ -138,7 +141,7 @@
         <label>模型类型
           <select name="kind">
             <option value="text">文本 / 推理模型（流式测 TTFT）</option>
-            <option value="image">图像模型（TTFT = 完整出图耗时，low / 1024x1024）</option>
+            <option value="image">图像模型（TTFT = 完整出图耗时，low / 1024x1024 / JPEG）</option>
           </select>
         </label>
         <label class="span2">端点 Endpoint
@@ -172,7 +175,7 @@
     <p class="muted" id="detail-meta"></p>
     <div class="chart-wrap big"><canvas id="detail-chart"></canvas></div>
     <table class="table compact">
-      <thead><tr><th>时间</th><th>触发</th><th>轮次</th><th>结果</th><th>TTFT</th><th>总耗时</th><th>HTTP</th><th>错误</th></tr></thead>
+      <thead><tr><th>时间</th><th>触发</th><th>轮次</th><th>结果</th><th>TTFT</th><th>总耗时</th><th title="检测期间同时进行的其他检测数">并发</th><th>HTTP</th><th>错误</th></tr></thead>
       <tbody id="detail-body"></tbody>
     </table>
   </dialog>

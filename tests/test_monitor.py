@@ -7,6 +7,7 @@ from app.feishu import FeishuNotConfigured
 from app.mailer import MailNotConfigured
 from app.monitor import Monitor
 from app.probes import ProbeResult
+from app.scheduling import ProbeGate, next_slot, resource_key
 
 
 def ok(ms):
@@ -227,5 +228,136 @@ def test_scheduler_trigger_sets_next_run(tmp_path):
 
     asyncio.run(run())
     m = h.db.get_model(h.model_id)
-    assert m["next_run_at"] > time.time() + 29 * 60
-    assert h.db.due_models(time.time()) == []
+    now = time.time()
+    assert now < m["next_run_at"] <= now + 30 * 60
+    assert m["next_run_at"] == next_slot(h.model_id, 30, m["next_run_at"] - 30 * 60)  # on the model's own slot
+    assert h.db.due_models(now) == []
+
+
+def test_slots_are_spread_and_stable():
+    period = 30 * 60
+    now = 1_800_000_000.0
+    offsets = sorted((next_slot(i, 30, now) - now) for i in range(1, 101))
+    gaps = [b - a for a, b in zip(offsets, offsets[1:])]
+    # 100 models in 30 minutes: perfectly even would be 18s apart; golden-ratio spacing stays close.
+    assert max(gaps) < 3 * period / 100 and min(gaps) > 0
+    # Same model always lands on the same phase of its interval.
+    assert (next_slot(7, 30, now) - next_slot(7, 30, now + 12345)) % period == 0
+
+
+def test_realign_on_start_spreads_checked_models(tmp_path):
+    h = Harness(tmp_path)
+    ids = [h.model_id] + [
+        h.db.insert_model({"name": f"m{i}", "kind": "text", "endpoint": "https://r.openai.azure.com", "deployment": "d",
+                           "api_key_enc": encrypt("k"), "interval_minutes": 30})
+        for i in range(5)
+    ]
+    past = time.time() - 3600
+    for i in ids[:-1]:
+        h.db.update_model(i, {"next_run_at": past, "last_check_at": past})
+    h.db.update_model(ids[-1], {"next_run_at": past, "last_check_at": None})  # never checked
+    h.monitor.realign_schedule()
+    due = {m["id"] for m in h.db.due_models(time.time())}
+    assert due == {ids[-1]}  # only the never-checked model runs right away; the rest wait for their slots
+
+
+def _gate(limits=None):
+    lim = {"text": 4, "image": 2, "host": 3, **(limits or {})}
+    return ProbeGate(lambda: lim)
+
+
+def test_gate_limits_and_interference():
+    gate = _gate({"image": 1})
+    log = []
+
+    async def probe(name, kind, host, hold, delay=0, exclusive=False):
+        await asyncio.sleep(delay)
+        async with gate.slot(kind, host, exclusive) as s:
+            log.append(("start", name, time.monotonic()))
+            await asyncio.sleep(hold)
+        log.append(("end", name, time.monotonic()))
+        return s
+
+    async def run():
+        return await asyncio.gather(
+            probe("img1", "image", "a", 0.3),
+            probe("img2", "image", "b", 0.1, delay=0.01),   # image limit 1 -> waits for img1
+            probe("txt1", "text", "c", 0.05, delay=0.02),   # overlaps img1 -> interfered
+            probe("txt2", "text", "c", 0.05, delay=0.5),    # runs alone -> clean
+        )
+
+    img1, img2, txt1, txt2 = asyncio.run(run())
+    starts = {n: t for e, n, t in log if e == "start"}
+    ends = {n: t for e, n, t in log if e == "end"}
+    assert starts["img2"] >= ends["img1"] - 0.01
+    assert txt1.interfered and txt1.concurrent >= 1
+    assert not txt2.interfered and txt2.concurrent == 0
+    assert img1.concurrent >= 1 and not img1.interfered  # only overlapped a text probe
+
+
+def test_gate_exclusive_waits_and_blocks():
+    gate = _gate()
+    order = []
+
+    async def probe(name, hold, delay=0, exclusive=False):
+        await asyncio.sleep(delay)
+        async with gate.slot("text", name, exclusive) as s:
+            order.append(f"+{name}")
+            await asyncio.sleep(hold)
+            order.append(f"-{name}")
+        return s
+
+    async def run():
+        return await asyncio.gather(
+            probe("a", 0.2),
+            probe("x", 0.1, delay=0.05, exclusive=True),  # waits for a to finish
+            probe("b", 0.05, delay=0.1),                  # arrives while x is waiting -> must go after x
+        )
+
+    a, x, b = asyncio.run(run())
+    assert order == ["+a", "-a", "+x", "-x", "+b", "-b"]
+    assert x.concurrent == 0 and not x.interfered
+
+
+def test_slow_retests_run_exclusive_and_are_recorded(tmp_path):
+    h = Harness(tmp_path)
+    h.db.update_model(h.model_id, {"baseline_manual_ms": 1000})
+    h.cycle(ok(2000), ok(900))
+    rows = sorted(h.db.list_checks(h.model_id, 0), key=lambda r: r["attempt"])
+    assert [r["exclusive"] for r in rows] == [0, 1]
+    assert all(r["concurrent"] == 0 for r in rows)
+    # Connectivity retests are not exclusive (a dead endpoint must not stall every other check).
+    h.cycle(fail(), ok(900))
+    last = [r for r in h.db.list_checks(h.model_id, 0) if r["attempt"] == 1][0]
+    assert last["exclusive"] == 0
+
+
+def test_already_slow_model_does_not_retest_exclusively(tmp_path):
+    h = Harness(tmp_path)
+    h.db.update_model(h.model_id, {"baseline_manual_ms": 1000})
+    m = h.cycle(ok(2000), ok(2000), ok(2000), ok(2000))
+    assert m["status"] == "slow"
+    h.cycle(ok(2000), ok(2000), ok(2000), ok(2000))
+    latest_cycle = sorted(h.db.list_checks(h.model_id, 0), key=lambda r: r["id"])[-4:]
+    assert [r["exclusive"] for r in latest_cycle] == [0, 0, 0, 0]
+
+
+def test_resource_key_groups_azure_host_aliases():
+    keys = {
+        resource_key("https://myres.openai.azure.com/"),
+        resource_key("https://MyRes.services.ai.azure.com/api/projects/p"),
+        resource_key("myres.cognitiveservices.azure.com"),
+    }
+    assert keys == {"azure:myres"}
+    assert resource_key("https://other.openai.azure.com") != "azure:myres"
+    assert resource_key("http://127.0.0.1:9100/v1") == "127.0.0.1"
+
+
+def test_interfered_samples_excluded_from_baseline(tmp_path):
+    h = Harness(tmp_path)
+    for v in (1000, 1000, 1000):
+        h.cycle(ok(v))
+    h.db.execute("UPDATE checks SET ttft_ms = 9000, interfered = 1 WHERE id = (SELECT MAX(id) FROM checks)")
+    h.cycle(ok(1100))
+    # 3 clean samples remain (1000, 1000, 1100) -> median 1000; the 9000 interfered sample is ignored.
+    assert h.monitor.baseline(h.db.get_model(h.model_id), h.db.get_settings()) == 1000

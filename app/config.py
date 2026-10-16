@@ -18,6 +18,10 @@ IMAGE_PROMPT = "A red apple on a white table"
 # Fixed so every image check does the same amount of work; "auto" defaults make generation time swing 20s~70s.
 IMAGE_QUALITY = "low"
 IMAGE_SIZE = "1024x1024"
+# JPEG cuts the response from ~1.7 MB (PNG) to ~0.2 MB with the same generation time and cost,
+# so image downloads no longer compete with concurrent text probes for bandwidth.
+IMAGE_OUTPUT_FORMAT = "jpeg"
+IMAGE_OUTPUT_COMPRESSION = 50
 TEXT_MAX_TOKENS = 1024
 TEXT_TIMEOUT_SECONDS = 120
 IMAGE_TIMEOUT_SECONDS = 300
@@ -30,6 +34,9 @@ DEFAULT_SETTINGS = {
     "retry_count": "3",
     "retry_gap_seconds": "5",
     "retention_days": "90",
+    "max_concurrent_text": "4",
+    "max_concurrent_image": "2",
+    "max_concurrent_per_host": "3",
     "smtp_host": "",
     "smtp_port": "465",
     "smtp_security": "ssl",

@@ -149,15 +149,28 @@ async def probe_text(
         return ProbeResult(False, status, None, _elapsed_ms(t0), f"网络错误: {type(e).__name__}: {_short(str(e))}")
 
 
+IMAGE_FORMAT_PARAMS = ("output_format", "output_compression")
+
+
 async def probe_image(client: httpx.AsyncClient, endpoint: str, deployment: str, api_key: str) -> ProbeResult:
     """Image endpoints don't stream by default, so TTFT == time until the full image response arrives."""
-    url = build_url(endpoint, "image")
     body = {
         "model": deployment,
         "prompt": config.IMAGE_PROMPT,
         "quality": config.IMAGE_QUALITY,
         "size": config.IMAGE_SIZE,
+        "output_format": config.IMAGE_OUTPUT_FORMAT,
+        "output_compression": config.IMAGE_OUTPUT_COMPRESSION,
     }
+    r = await _post_image(client, endpoint, body, api_key)
+    if r.rejected_param:
+        # Non-OpenAI image models may not know the output format options: retry with plain PNG.
+        r = await _post_image(client, endpoint, {k: v for k, v in body.items() if k not in IMAGE_FORMAT_PARAMS}, api_key)
+    return r
+
+
+async def _post_image(client: httpx.AsyncClient, endpoint: str, body: dict, api_key: str) -> ProbeResult:
+    url = build_url(endpoint, "image")
     t0 = time.perf_counter()
     status = None
     try:
@@ -166,7 +179,8 @@ async def probe_image(client: httpx.AsyncClient, endpoint: str, deployment: str,
         status = resp.status_code
         elapsed = _elapsed_ms(t0)
         if status != 200:
-            return ProbeResult(False, status, None, elapsed, f"HTTP {status}: {_short(resp.text)}")
+            rejected = next((p for p in IMAGE_FORMAT_PARAMS if p in body and _param_rejected(status, resp.text, p)), None)
+            return ProbeResult(False, status, None, elapsed, f"HTTP {status}: {_short(resp.text)}", rejected_param=rejected)
         try:
             data = resp.json().get("data") or []
         except ValueError:

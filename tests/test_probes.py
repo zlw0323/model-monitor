@@ -137,8 +137,34 @@ def test_probe_image_success_and_defaults():
 
     r = asyncio.run(run())
     assert r.success and r.ttft_ms == r.total_ms
-    assert seen["body"] == {"model": "gpt-image-1", "prompt": config.IMAGE_PROMPT, "quality": "low", "size": "1024x1024"}
+    assert seen["body"] == {
+        "model": "gpt-image-1",
+        "prompt": config.IMAGE_PROMPT,
+        "quality": "low",
+        "size": "1024x1024",
+        "output_format": "jpeg",
+        "output_compression": 50,
+    }
     assert seen["url"] == "https://r.openai.azure.com/openai/v1/images/generations"
+
+
+def test_probe_image_falls_back_when_format_unsupported():
+    bodies = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        if "output_format" in body:
+            return httpx.Response(400, json={"error": {"message": "Unknown parameter: 'output_format'."}})
+        return httpx.Response(200, json={"data": [{"url": "https://x/img.png"}]})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+            return await probe_image(c, "https://r.services.ai.azure.com", "flux", "k")
+
+    r = asyncio.run(run())
+    assert r.success and len(bodies) == 2
+    assert "output_format" not in bodies[1] and "output_compression" not in bodies[1]
 
 
 def test_probe_image_empty_data_is_failure():

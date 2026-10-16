@@ -17,6 +17,7 @@ from .feishu import FeishuNotConfigured, Notice
 from .feishu import send as send_feishu
 from .mailer import MailNotConfigured, send_mail
 from .probes import TOKEN_PARAMS, ProbeResult, probe_image, probe_text
+from .scheduling import ProbeGate, next_slot, resource_key
 
 log = logging.getLogger("monitor")
 
@@ -61,15 +62,38 @@ class Monitor:
         self._tick_seconds = tick_seconds
         self._client: httpx.AsyncClient | None = None
         self._running: dict[int, asyncio.Task] = {}
+        self._queued: set[int] = set()
         self._loop_task: asyncio.Task | None = None
         self._retry_task: asyncio.Task | None = None
         self._send_lock = asyncio.Lock()
         self._last_purge = 0.0
+        self._limits_cache: tuple[float, dict[str, int]] = (0.0, {})
+        self.gate = ProbeGate(self._current_limits)
+
+    def _current_limits(self) -> dict[str, int]:
+        at, cached = self._limits_cache
+        if time.time() - at > 5 or not cached:
+            s = self.db.get_settings()
+            cached = {
+                "text": int(s.get("max_concurrent_text") or 4),
+                "image": int(s.get("max_concurrent_image") or 2),
+                "host": int(s.get("max_concurrent_per_host") or 3),
+            }
+            self._limits_cache = (time.time(), cached)
+        return cached
 
     # ---- lifecycle ----
     async def start(self) -> None:
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=15.0), follow_redirects=False)
+        self.realign_schedule()
         self._loop_task = asyncio.create_task(self._loop())
+
+    def realign_schedule(self) -> None:
+        """Put every already-checked model on its staggered slot, so a restart doesn't fire them all at once."""
+        now = time.time()
+        for m in self.db.list_models():
+            if m["enabled"] and m["last_check_at"] is not None:
+                self.db.update_model(m["id"], {"next_run_at": next_slot(m["id"], m["interval_minutes"], now)})
 
     async def stop(self) -> None:
         tasks = [t for t in (self._loop_task, self._retry_task, *self._running.values()) if t]
@@ -101,6 +125,9 @@ class Monitor:
     def is_running(self, model_id: int) -> bool:
         return model_id in self._running
 
+    def is_queued(self, model_id: int) -> bool:
+        return model_id in self._queued
+
     def trigger(self, model_id: int, trigger: str) -> bool:
         if model_id in self._running:
             return False
@@ -108,7 +135,7 @@ class Monitor:
         if not m:
             return False
         if trigger == "schedule":
-            self.db.update_model(model_id, {"next_run_at": time.time() + m["interval_minutes"] * 60})
+            self.db.update_model(model_id, {"next_run_at": next_slot(model_id, m["interval_minutes"], time.time())})
         task = asyncio.create_task(self.run_cycle(model_id, trigger))
         self._running[model_id] = task
         task.add_done_callback(lambda _t, mid=model_id: self._running.pop(mid, None))
@@ -170,12 +197,23 @@ class Monitor:
             key_error = None
 
         cycle_id = uuid.uuid4().hex[:12]
-        attempts: list[tuple[ProbeResult, str, float]] = []
+        host = resource_key(m["endpoint"])
+        attempts: list[tuple[ProbeResult, str, float, bool]] = []
         for attempt in range(retries + 1):
             if attempt:
                 await asyncio.sleep(gap)
-            ts = time.time()
-            r = ProbeResult(False, error=key_error) if key_error else await self._probe(m, key)
+            # A TTFT anomaly is re-measured with nothing else in flight, so a new alert rests on clean samples.
+            # Not done when the model is already known to be slow (that would stall all checks every cycle),
+            # nor for connectivity retests (a dead endpoint can take minutes to time out).
+            exclusive = bool(attempts) and attempts[-1][1] == "slow" and m["status"] != "slow"
+            self._queued.add(model_id)
+            try:
+                async with self.gate.slot(m["kind"], host, exclusive) as slot:
+                    self._queued.discard(model_id)
+                    ts = time.time()
+                    r = ProbeResult(False, error=key_error) if key_error else await self._probe(m, key)
+            finally:
+                self._queued.discard(model_id)
             verdict = classify(r, baseline, pct)
             self.db.insert_check(
                 {
@@ -191,9 +229,12 @@ class Monitor:
                     "anomaly": int(verdict != "ok"),
                     "baseline_ms": baseline,
                     "error": r.error,
+                    "concurrent": slot.concurrent,
+                    "interfered": int(slot.interfered),
+                    "exclusive": int(exclusive),
                 }
             )
-            attempts.append((r, verdict, ts))
+            attempts.append((r, verdict, ts, exclusive))
             if verdict == "ok":
                 break
 
@@ -309,8 +350,8 @@ class Monitor:
         else:
             facts.append(("TTFT 基线", "样本不足，尚未启用 TTFT 预警"))
         details = []
-        for i, (r, v, ts) in enumerate(attempts):
-            label = "首次检测" if i == 0 else f"第 {i} 次重测"
+        for i, (r, v, ts, exclusive) in enumerate(attempts):
+            label = "首次检测" if i == 0 else f"第 {i} 次重测" + ("（独占）" if exclusive else "")
             state = {"ok": "正常", "slow": "TTFT 超标", "down": "失败"}[v]
             ttft = f"{r.ttft_ms:.0f} ms" if r.ttft_ms is not None else "-"
             http = r.http_status if r.http_status is not None else "-"

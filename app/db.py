@@ -39,7 +39,10 @@ CREATE TABLE IF NOT EXISTS checks (
     total_ms REAL,
     anomaly INTEGER NOT NULL DEFAULT 0,
     baseline_ms REAL,
-    error TEXT
+    error TEXT,
+    concurrent INTEGER,
+    interfered INTEGER NOT NULL DEFAULT 0,
+    exclusive INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_checks_model_ts ON checks(model_id, ts);
 CREATE TABLE IF NOT EXISTS alerts (
@@ -75,6 +78,14 @@ class Database:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(SCHEMA)
+            check_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(checks)")}
+            for col, ddl in (
+                ("concurrent", "INTEGER"),
+                ("interfered", "INTEGER NOT NULL DEFAULT 0"),
+                ("exclusive", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if col not in check_cols:
+                    self._conn.execute(f"ALTER TABLE checks ADD COLUMN {col} {ddl}")
             cols = {r[1] for r in self._conn.execute("PRAGMA table_info(alerts)")}
             for col, ddl in (
                 ("feishu_status", "TEXT"),
@@ -163,9 +174,9 @@ class Database:
         return self.one("SELECT * FROM checks WHERE model_id = ? ORDER BY ts DESC, id DESC LIMIT 1", (model_id,))
 
     def auto_baseline(self, model: dict[str, Any], window: int, min_samples: int) -> tuple[float | None, int]:
-        """Median TTFT of the most recent normal (successful, non-anomalous) checks."""
+        """Median TTFT of the most recent clean checks: successful, not anomalous, not overlapping an image probe."""
         rows = self.all(
-            "SELECT ttft_ms FROM checks WHERE model_id = ? AND success = 1 AND anomaly = 0 "
+            "SELECT ttft_ms FROM checks WHERE model_id = ? AND success = 1 AND anomaly = 0 AND interfered = 0 "
             "AND ttft_ms IS NOT NULL AND ts > ? ORDER BY ts DESC LIMIT ?",
             (model["id"], model.get("baseline_reset_at") or 0, window),
         )
