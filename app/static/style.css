@@ -80,6 +80,29 @@ code { background: #f3f4f6; padding: 1px 4px; border-radius: 4px; font-size: 12p
 .models-table .badge + .badge { margin-left: 4px; }
 .models-table .col-actions .btn + .btn { margin-left: 4px; }
 th.sortable { cursor: pointer; user-select: none; }
+.matrix-hint { margin: 0; padding: 10px 14px 4px; }
+.matrix-table { font-size: 13px; }
+.matrix-table th { background: #f9fafb; white-space: nowrap; vertical-align: bottom; }
+.matrix-table td { vertical-align: middle; padding: 6px 8px; }
+.matrix-table th.mx-region { text-align: center; min-width: 130px; color: var(--text); font-size: 13px; }
+.matrix-table .mx-model { position: sticky; left: 0; z-index: 1; background: #fff; min-width: 170px; box-shadow: 1px 0 0 var(--border); }
+.matrix-table th.mx-model { background: #f9fafb; }
+.matrix-table .model-name { font-weight: 500; font-size: 13px; }
+.matrix-table tr.mx-group td { background: #f3f4f6; color: var(--muted); font-size: 12px; font-weight: 600; padding: 4px 8px; }
+.mx-cell { text-align: center; }
+.mx-none { color: #d1d5db; }
+.mx-dep { display: block; width: 100%; min-width: 120px; border: 1px solid var(--border); border-radius: 8px; padding: 4px 8px; background: #fff; color: var(--text); font-size: 12px; line-height: 1.45; text-align: left; cursor: pointer; }
+.mx-dep + .mx-dep { margin-top: 4px; }
+.mx-dep:hover { filter: brightness(0.96); }
+.mx-dep.ok { background: #ecfdf5; border-color: #a7f3d0; } .mx-dep.ok b { color: #065f46; }
+.mx-dep.warn { background: #fffbeb; border-color: #fde68a; } .mx-dep.warn b { color: #92400e; }
+.mx-dep.bad { background: #fef2f2; border-color: #fecaca; } .mx-dep.bad b { color: #991b1b; }
+.mx-dep.muted { background: #f9fafb; color: var(--muted); }
+.mx-line { display: flex; justify-content: space-between; gap: 10px; }
+.mx-sub { color: var(--muted); font-size: 11px; }
+.mx-reason { display: block; max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.ok-text { color: #059669; }
+.bad-text { color: #dc2626; }
 th.sortable:hover { color: var(--text); }
 th.sorted[data-dir=asc]::after { content: " ▲"; font-size: 9px; }
 th.sorted[data-dir=desc]::after { content: " ▼"; font-size: 9px; }

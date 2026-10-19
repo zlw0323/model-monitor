@@ -38,7 +38,11 @@
         <div class="summary chips" id="summary"></div>
         <div class="toolbar">
           <div class="filters">
-            <input id="f-search" type="search" placeholder="搜索名称 / 部署名称" autocomplete="off">
+            <div class="segmented" id="view-switch" role="group" aria-label="视图">
+              <button type="button" data-view="list">列表</button>
+              <button type="button" data-view="matrix">地区对照</button>
+            </div>
+            <input id="f-search" type="search" placeholder="搜索名称 / 部署名称 / 地区" autocomplete="off">
             <select id="f-kind" title="类型">
               <option value="">全部类型</option>
               <option value="text">文本/推理</option>
@@ -60,7 +64,7 @@
           <button class="btn small danger" data-bulk="delete">删除</button>
           <button class="btn small ghost-dark" id="bulk-clear">取消选择</button>
         </div>
-        <div class="card table-card">
+        <div class="card table-card" id="list-card">
           <div class="table-wrap">
             <table class="table models-table">
               <thead><tr>
@@ -82,6 +86,16 @@
           </div>
           <p id="empty-hint" class="muted empty-row hidden"></p>
         </div>
+        <div class="card table-card hidden" id="matrix-card">
+          <p class="muted small matrix-hint">每行是一个模型（按部署名称归类），每列是一个地区；空白格表示该地区还没有部署此模型。点击格子查看详情。</p>
+          <div class="table-wrap">
+            <table class="table matrix-table">
+              <thead id="matrix-head"></thead>
+              <tbody id="matrix-body"></tbody>
+            </table>
+          </div>
+          <p id="matrix-empty" class="muted empty-row hidden"></p>
+        </div>
       </div>
 
       <div id="tab-resources" class="tab hidden">
@@ -93,7 +107,7 @@
           <p class="muted small">同一个资源下的所有部署共用端点和 API Key。更换 Key 只需在这里改一次，该资源下的模型会在 2 分钟内陆续用新 Key 检测。</p>
           <div class="table-wrap">
             <table class="table">
-              <thead><tr><th>名称</th><th>端点</th><th>API Key</th><th class="num">模型数</th><th>状态</th><th class="col-actions">操作</th></tr></thead>
+              <thead><tr><th>名称</th><th>地区</th><th>端点</th><th>API Key</th><th class="num">模型数</th><th>状态</th><th class="col-actions">操作</th></tr></thead>
               <tbody id="resource-body"></tbody>
             </table>
           </div>
@@ -218,6 +232,9 @@
         </label>
         <label>部署名称 Deployment<input name="deployment" required maxlength="200" placeholder="gpt-5"></label>
         <label>显示名称<input name="name" required maxlength="100" placeholder="GPT-5 美东2"></label>
+        <label>模型（地区对照中按它归类）<input name="base_model" maxlength="200" placeholder="留空=部署名称">
+          <small class="muted">部署名称与模型名不一致时填写，如部署名 gpt5-prod 填 gpt-5。</small>
+        </label>
         <label>模型类型
           <select name="kind">
             <option value="text">文本 / 推理模型（流式测 TTFT）</option>
@@ -251,6 +268,10 @@
       <div class="form-grid">
         <label>名称<input name="name" required maxlength="100" placeholder="myres-美东2"></label>
         <label>API Key<input name="api_key" type="password" autocomplete="new-password"></label>
+        <label>地区<input name="region" maxlength="50" list="region-options" placeholder="留空=使用资源名称，如 美东2">
+          <small class="muted">同一地区的多个资源请填写相同的地区名，地区对照会把它们放在同一列。</small>
+        </label>
+        <datalist id="region-options"></datalist>
         <label class="span2">端点 Endpoint
           <input name="endpoint" required maxlength="1000" placeholder="https://your-resource.openai.azure.com/">
           <small class="muted">支持 *.openai.azure.com / *.services.ai.azure.com / *.cognitiveservices.azure.com，自动使用 v1 API（/openai/v1）。</small>
@@ -270,7 +291,7 @@
       <h2>批量导入模型</h2>
       <button class="btn" id="import-close">关闭</button>
     </div>
-    <p class="muted small">从 Excel 复制整张表粘贴到下面，或选择 CSV 文件。第一行为表头，必填列：<b>资源</b>、<b>类型</b>（文本/图像）、<b>部署名称</b>；可选列：名称、检测间隔、预警阈值、手动基线、启用。资源需先在“资源”页创建，表中不包含任何 API Key。
+    <p class="muted small">从 Excel 复制整张表粘贴到下面，或选择 CSV 文件。第一行为表头，必填列：<b>资源</b>、<b>类型</b>（文本/图像）、<b>部署名称</b>；可选列：名称、模型（地区对照中的归类，留空=部署名称）、检测间隔、预警阈值、手动基线、启用。资源需先在“资源”页创建，表中不包含任何 API Key。
       <a href="/api/models/import-template" download>下载模板</a></p>
     <div class="import-input">
       <textarea id="import-text" rows="8" spellcheck="false" placeholder="资源	名称	类型	部署名称	检测间隔&#10;myres	GPT-5 美东2	文本	gpt-5	30"></textarea>
@@ -307,7 +328,6 @@
         <button class="btn small" id="detail-reset-baseline" title="清空已学习的自动基线，用之后的检测结果重新学习">重置自动基线</button>
       </div>
     </div>
-    <p class="muted" id="detail-meta"></p>
     <div class="chart-wrap big"><canvas id="detail-chart"></canvas></div>
     <table class="table compact">
       <thead><tr><th>时间</th><th>触发</th><th>轮次</th><th>结果</th><th>TTFT</th><th>总耗时</th><th title="检测期间同时进行的其他检测数">并发</th><th>HTTP</th><th>错误</th></tr></thead>

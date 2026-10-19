@@ -200,7 +200,7 @@ def test_dashboard_batch(tmp_path):
             d = c.get("/api/dashboard").json()
             if all(m["latest"] for m in d["models"]):
                 break
-        assert len(d["models"]) == 3 and d["resources"] == [{"id": res["id"], "name": "res", "model_count": 3}]
+        assert len(d["models"]) == 3 and d["resources"] == [{"id": res["id"], "name": "res", "region": "res", "model_count": 3}]
         for m in d["models"]:
             assert m["availability_24h"] == 100 and m["latest"]["ttft_ms"] == 123.0
             assert m["spark"] and m["spark"][0][1] == 123 and m["spark"][0][2] == 0

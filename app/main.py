@@ -75,8 +75,9 @@ class ModelIn(BaseModel):
     interval_minutes: int = Field(30, ge=1, le=1440)
     ttft_threshold_pct: float | None = Field(None, gt=0, le=10000)
     baseline_manual_ms: float | None = Field(None, gt=0)
+    base_model: str | None = Field(None, max_length=200)  # model identity for the region view; None = deployment
 
-    @field_validator("name", "deployment", "endpoint_override", mode="before")
+    @field_validator("name", "deployment", "endpoint_override", "base_model", mode="before")
     @classmethod
     def _strip(cls, v):
         return v.strip() if isinstance(v, str) else v
@@ -91,8 +92,9 @@ class ResourceIn(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     endpoint: str = Field(min_length=1, max_length=1000)
     api_key: str | None = Field(None, max_length=500)
+    region: str = Field("", max_length=50)  # empty = use the resource name as the region
 
-    @field_validator("name", "endpoint", "api_key", mode="before")
+    @field_validator("name", "endpoint", "api_key", "region", mode="before")
     @classmethod
     def _strip(cls, v):
         return v.strip() if isinstance(v, str) else v
@@ -258,7 +260,10 @@ def create_app(
             "kind": m["kind"],
             "resource_id": m["resource_id"],
             "resource_name": m["resource_name"],
+            "region": m["region"],
             "deployment": m["deployment"],
+            "base_model": m["base_model"],
+            "model": m["base_model"] or m["deployment"],
             "endpoint_override": m["endpoint_override"],
             "request_url": build_url(m["endpoint"], m["kind"]),
             "enabled": bool(m["enabled"]),
@@ -308,6 +313,7 @@ def create_app(
         return {
             "id": r["id"],
             "name": r["name"],
+            "region": r.get("region") or "",
             "endpoint": r["endpoint"],
             "api_key_masked": key_mask,
             "model_count": r.get("model_count", 0),
@@ -358,7 +364,8 @@ def create_app(
         spark = db.sparklines(now - min(max(spark_hours, 1), 24 * 7) * 3600, 48)
         models = [serialize(m, mon, s, latest.get(m["id"]), avail.get(m["id"]), spark.get(m["id"], []))
                   for m in db.list_models()]
-        resources = [{"id": r["id"], "name": r["name"], "model_count": r["model_count"]} for r in db.list_resources()]
+        resources = [{"id": r["id"], "name": r["name"], "region": r["region"] or r["name"], "model_count": r["model_count"]}
+                     for r in db.list_resources()]
         return {"models": models, "resources": resources, "now": now,
                 "monitor": {"network_down_since": mon.outage_since}}
 
@@ -387,6 +394,7 @@ def create_app(
                 "interval_minutes": body.interval_minutes,
                 "ttft_threshold_pct": body.ttft_threshold_pct,
                 "baseline_manual_ms": body.baseline_manual_ms,
+                "base_model": body.base_model or None,
                 "next_run_at": time.time(),
             }
         )
@@ -414,6 +422,7 @@ def create_app(
             "interval_minutes": body.interval_minutes,
             "ttft_threshold_pct": body.ttft_threshold_pct,
             "baseline_manual_ms": body.baseline_manual_ms,
+            "base_model": body.base_model or None,
         }
         target_changed = any(old[k] != fields[k] for k in ("kind", "resource_id", "deployment", "endpoint_override"))
         if target_changed:
@@ -477,7 +486,7 @@ def create_app(
                 model_id = db.insert_model({
                     "name": r.name, "kind": r.kind, "resource_id": r.resource_id, "deployment": r.deployment,
                     "enabled": int(r.enabled), "interval_minutes": r.interval, "ttft_threshold_pct": r.threshold,
-                    "baseline_manual_ms": r.baseline,
+                    "baseline_manual_ms": r.baseline, "base_model": r.base_model or None,
                 })
                 db.update_model(model_id, {"next_run_at": soon(model_id, 300)})
                 created += 1
@@ -518,7 +527,8 @@ def create_app(
         if not body.api_key:
             raise HTTPException(422, "请填写 API Key")
         check_resource_name(db, body.name)
-        rid = db.insert_resource({"name": body.name, "endpoint": body.endpoint, "api_key_enc": encrypt(body.api_key)})
+        rid = db.insert_resource({"name": body.name, "endpoint": body.endpoint, "api_key_enc": encrypt(body.api_key),
+                                  "region": body.region})
         return serialize_resource({**db.get_resource(rid), "model_count": 0})
 
     @app.put("/api/resources/{resource_id}")
@@ -536,7 +546,7 @@ def create_app(
             bad = [m["name"] for m in models if m["endpoint_override"] and _origin(m["endpoint_override"]) != _origin(body.endpoint)]
             if bad:
                 raise HTTPException(422, f"以下模型的自定义请求地址仍指向旧主机，请先修改：{'、'.join(bad[:5])}")
-        fields: dict[str, Any] = {"name": body.name, "endpoint": body.endpoint}
+        fields: dict[str, Any] = {"name": body.name, "endpoint": body.endpoint, "region": body.region}
         if body.api_key:
             fields["api_key_enc"] = encrypt(body.api_key)
         db.update_resource(resource_id, fields)

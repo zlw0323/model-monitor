@@ -126,7 +126,7 @@ Object.assign(state, {
   resList: [],
   selected: new Set(),
   sort: { key: "status", dir: 1 },
-  filter: { status: "", search: "", kind: "", resource: "", abnormal: false },
+  filter: { status: "", search: "", kind: "", resource: "", abnormal: false, view: "list" },
 });
 try {
   Object.assign(state.filter, JSON.parse(localStorage.getItem(FILTER_KEY) || "{}"));
@@ -153,7 +153,7 @@ async function loadDashboard() {
   for (const id of [...state.selected]) if (!ids.has(id)) state.selected.delete(id);
   renderResourceFilter();
   renderSummary();
-  renderTable();
+  renderView();
   if (state.detailId && $("#detail-dialog").open) refreshDetail();
 }
 
@@ -196,7 +196,7 @@ function filteredModels() {
     if (f.abnormal && st !== "down" && st !== "slow") return false;
     if (f.kind && m.kind !== f.kind) return false;
     if (f.resource && String(m.resource_id) !== String(f.resource)) return false;
-    if (q && !`${m.name} ${m.deployment} ${m.resource_name}`.toLowerCase().includes(q)) return false;
+    if (q && !`${m.name} ${m.deployment} ${m.model} ${m.resource_name} ${m.region}`.toLowerCase().includes(q)) return false;
     return true;
   });
 }
@@ -282,7 +282,7 @@ function renderTable() {
       <td class="col-check"><input type="checkbox" data-id="${m.id}" ${sel ? "checked" : ""} aria-label="选择"></td>
       <td class="nowrap">${statusCell(m)}</td>
       <td><div class="model-name">${esc(m.name)}</div><div class="muted small">${esc(m.deployment)}</div></td>
-      <td>${esc(m.resource_name)}</td>
+      <td>${esc(m.resource_name)}${m.region !== m.resource_name ? `<div class="muted small">${esc(m.region)}</div>` : ""}</td>
       <td class="nowrap">${KIND[m.kind]}</td>
       <td class="num nowrap">${ttftCell(m)}</td>
       <td class="num nowrap">${baselineText(m)}<div class="muted small">${th ? `> ${fmtMs(th)}` : ""}</div></td>
@@ -299,7 +299,7 @@ function renderTable() {
 
 function syncBulkBar(list = sortModels(filteredModels())) {
   const n = state.selected.size;
-  $("#bulk-bar").classList.toggle("hidden", n === 0);
+  $("#bulk-bar").classList.toggle("hidden", n === 0 || state.filter.view === "matrix");
   $("#bulk-count").textContent = `已选 ${n} 个模型`;
   const visible = list.map((m) => m.id);
   const checkedVisible = visible.filter((id) => state.selected.has(id)).length;
@@ -308,6 +308,112 @@ function syncBulkBar(list = sortModels(filteredModels())) {
   all.indeterminate = checkedVisible > 0 && checkedVisible < visible.length;
 }
 
+// ---------- dashboard (region matrix view) ----------
+function renderView() {
+  const matrix = state.filter.view === "matrix";
+  $$("#view-switch button").forEach((b) => b.classList.toggle("active", b.dataset.view === state.filter.view));
+  $("#list-card").classList.toggle("hidden", matrix);
+  $("#matrix-card").classList.toggle("hidden", !matrix);
+  $("#f-resource").classList.toggle("hidden", matrix); // regions are the columns there
+  if (matrix) {
+    renderMatrix();
+    $("#bulk-bar").classList.add("hidden");
+  } else {
+    renderTable();
+  }
+}
+
+// Rows are models (deployment name, or the model field when set), grouped across all resources and regions.
+// Filters pick whole rows, so a row always shows every region: a blank cell then really means "not deployed".
+function matrixRows() {
+  const f = state.filter;
+  const q = f.search.trim().toLowerCase();
+  const groups = new Map();
+  for (const m of state.models) {
+    if (f.kind && m.kind !== f.kind) continue;
+    const key = `${m.kind}|${m.model.toLowerCase()}`;
+    if (!groups.has(key)) groups.set(key, { kind: m.kind, model: m.model, items: [] });
+    groups.get(key).items.push(m);
+  }
+  const abnormal = (m) => ["down", "slow"].includes(effStatus(m));
+  return [...groups.values()]
+    .filter((g) => !q || g.items.some((m) => `${m.model} ${m.name} ${m.deployment} ${m.resource_name} ${m.region}`.toLowerCase().includes(q)))
+    .filter((g) => !f.status || g.items.some((m) => effStatus(m) === f.status))
+    .filter((g) => !f.abnormal || g.items.some(abnormal))
+    .sort((a, b) => (a.kind === b.kind ? 0 : a.kind === "text" ? -1 : 1) || a.model.localeCompare(b.model, "en", { numeric: true }));
+}
+
+function mxChip(m, showResource) {
+  const st = effStatus(m);
+  const meta = st === "disabled" ? { label: "已停用", cls: "muted" } : STATUS[st] || STATUS.unknown;
+  const l = m.latest;
+  const ttft = l && l.success ? fmtMs(l.ttft_ms) : "";
+  const tip = [
+    m.name,
+    `资源 ${m.resource_name} · 部署 ${m.deployment}`,
+    m.incident ? `${m.incident.label || ""}，自 ${fmtTime(m.incident.since)} 起` : "",
+    l && !l.success ? l.error : "",
+    `24h 可用率 ${fmtPct(m.availability_24h)} · 上次检测 ${relTime(m.last_check_at)}`,
+  ].filter(Boolean).join("\n");
+  return `<button type="button" class="mx-dep ${meta.cls}" data-id="${m.id}" title="${esc(tip)}">
+    <span class="mx-line"><b>${meta.label}${m.running ? " …" : ""}</b><span>${ttft}</span></span>
+    ${m.incident && m.incident.label ? `<span class="mx-reason">${esc(m.incident.label)}</span>` : ""}
+    <span class="mx-line mx-sub"><span>24h ${fmtPct(m.availability_24h)}</span>${showResource ? `<span>${esc(m.resource_name)}</span>` : ""}</span>
+  </button>`;
+}
+
+function renderMatrix() {
+  const rows = matrixRows();
+  const perRegion = new Map();
+  for (const g of rows) for (const m of g.items) {
+    if (!perRegion.has(m.region)) perRegion.set(m.region, []);
+    perRegion.get(m.region).push(m);
+  }
+  const regions = [...perRegion.keys()].sort((a, b) => perRegion.get(b).length - perRegion.get(a).length || a.localeCompare(b, "zh"));
+  const empty = $("#matrix-empty");
+  empty.textContent = state.models.length ? "没有符合筛选条件的模型。" : "还没有模型。先在“资源”页添加 Azure 资源并填写地区，再添加模型。";
+  empty.classList.toggle("hidden", rows.length > 0);
+  const live = (ms) => ms.filter((m) => m.enabled);
+  const up = (ms) => ms.some((m) => m.status === "ok" || m.status === "slow");
+  $("#matrix-head").innerHTML = rows.length ? `<tr><th class="mx-model">模型</th>
+    <th class="num" title="能连通的地区数 / 已部署的地区数（不含已停用）">可用地区</th>
+    ${regions.map((r) => {
+      const ms = live(perRegion.get(r));
+      const ok = ms.filter((m) => m.status === "ok").length;
+      return `<th class="mx-region">${esc(r)}<div class="muted small">正常 ${ok}/${ms.length}</div></th>`;
+    }).join("")}</tr>` : "";
+  let kind = null;
+  $("#matrix-body").innerHTML = rows.map((g) => {
+    const head = g.kind !== kind ? `<tr class="mx-group"><td colspan="${regions.length + 2}">${KIND[g.kind]}模型</td></tr>` : "";
+    kind = g.kind;
+    const byRegion = regions.map((r) => g.items.filter((m) => m.region === r));
+    const deployed = byRegion.filter((ms) => live(ms).length);
+    const n = deployed.filter((ms) => up(live(ms))).length;
+    const cls = !deployed.length ? "muted" : n === deployed.length ? "ok-text" : n === 0 ? "bad-text" : "warn-text";
+    const cells = byRegion.map((ms) => {
+      if (!ms.length) return '<td class="mx-cell mx-none" title="该地区未部署此模型">—</td>';
+      const sorted = [...ms].sort((a, b) => SEVERITY[effStatus(a)] - SEVERITY[effStatus(b)]);
+      return `<td class="mx-cell">${sorted.map((m) => mxChip(m, ms.length > 1)).join("")}</td>`;
+    }).join("");
+    return `${head}<tr><td class="mx-model"><div class="model-name">${esc(g.model)}</div></td>
+      <td class="num nowrap"><b class="${cls}">${n}/${deployed.length}</b></td>${cells}</tr>`;
+  }).join("");
+}
+$("#view-switch").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-view]");
+  if (!b || b.dataset.view === state.filter.view) return;
+  state.filter.view = b.dataset.view;
+  saveFilters();
+  renderView();
+});
+$("#matrix-body").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-id]");
+  if (!b) return;
+  state.detailId = Number(b.dataset.id);
+  $("#detail-dialog").showModal();
+  refreshDetail();
+});
+
 // filters / sorting / selection
 $("#summary").addEventListener("click", (e) => {
   const b = e.target.closest("[data-status]");
@@ -315,21 +421,21 @@ $("#summary").addEventListener("click", (e) => {
   state.filter.status = state.filter.status === b.dataset.status ? "" : b.dataset.status;
   saveFilters();
   renderSummary();
-  renderTable();
+  renderView();
 });
 for (const [id, key, ev] of [["#f-search", "search", "input"], ["#f-kind", "kind", "change"], ["#f-resource", "resource", "change"]]) {
   $(id).value = state.filter[key];
   $(id).addEventListener(ev, (e) => {
     state.filter[key] = e.target.value;
     saveFilters();
-    renderTable();
+    renderView();
   });
 }
 $("#f-abnormal").checked = state.filter.abnormal;
 $("#f-abnormal").addEventListener("change", (e) => {
   state.filter.abnormal = e.target.checked;
   saveFilters();
-  renderTable();
+  renderView();
 });
 $(".models-table thead").addEventListener("click", (e) => {
   const th = e.target.closest("th[data-sort]");
@@ -468,7 +574,7 @@ async function refreshDetail() {
   $$("#detail-range button").forEach((b) => b.classList.toggle("active", Number(b.dataset.hours) === hours));
   $("#detail-title").textContent = m.name;
   $("#detail-status").innerHTML = statusCell(m);
-  $("#detail-meta").innerHTML = `${KIND[m.kind]} · 资源 ${esc(m.resource_name)} · 部署 ${esc(m.deployment)}<br>请求地址：<code>${esc(m.request_url)}</code>${m.kind === "text" ? ` · token 参数：<code>${esc(m.token_param)}</code>` : ""}`;
+  $("#detail-meta").innerHTML = `${KIND[m.kind]} · 地区 ${esc(m.region)} · 资源 ${esc(m.resource_name)} · 部署 ${esc(m.deployment)}${m.base_model ? ` · 模型 ${esc(m.base_model)}` : ""}<br>请求地址：<code>${esc(m.request_url)}</code>${m.kind === "text" ? ` · token 参数：<code>${esc(m.token_param)}</code>` : ""}`;
   const checks = await api(`/api/models/${m.id}/checks?hours=${hours}`).catch(() => []);
   if (detailChart) detailChart.destroy();
   detailChart = new Chart($("#detail-chart"), chartConfig(m, checks));
@@ -527,6 +633,7 @@ async function openModelDialog(m) {
     form.ttft_threshold_pct.value = m.ttft_threshold_pct ?? "";
     form.baseline_manual_ms.value = m.baseline_manual_ms ?? "";
     form.endpoint_override.value = m.endpoint_override ?? "";
+    form.base_model.value = m.base_model ?? "";
     form.enabled.checked = m.enabled;
     $(".advanced", form).open = Boolean(m.endpoint_override);
   } else {
@@ -554,6 +661,7 @@ $("#model-form").addEventListener("submit", async (e) => {
     interval_minutes: Number(f.interval_minutes.value),
     ttft_threshold_pct: num(f.ttft_threshold_pct.value),
     baseline_manual_ms: num(f.baseline_manual_ms.value),
+    base_model: f.base_model.value.trim() || null,
   };
   try {
     if (state.editingId) await api(`/api/models/${state.editingId}`, { method: "PUT", body });
@@ -645,10 +753,12 @@ async function loadResources() {
     const n = (st) => ms.filter((m) => effStatus(m) === st).length;
     const stat = [["ok", "ok", "正常"], ["slow", "warn", "TTFT 异常"], ["down", "bad", "失败"]]
       .filter(([st]) => n(st)).map(([st, cls, lbl]) => `<span class="badge ${cls}">${lbl} ${n(st)}</span>`).join(" ") || '<span class="muted">-</span>';
-    return `<tr data-id="${r.id}"><td><b>${esc(r.name)}</b></td><td><code>${esc(r.endpoint)}</code></td><td><code>${esc(r.api_key_masked)}</code></td>
+    return `<tr data-id="${r.id}"><td><b>${esc(r.name)}</b></td>
+      <td>${r.region ? esc(r.region) : `<span class="muted" title="未填写地区，地区对照中使用资源名称">${esc(r.name)}</span>`}</td>
+      <td><code>${esc(r.endpoint)}</code></td><td><code>${esc(r.api_key_masked)}</code></td>
       <td class="num">${r.model_count}</td><td>${stat}</td>
       <td class="col-actions nowrap"><button class="btn small" data-act="models">查看模型</button><button class="btn small" data-act="edit">编辑</button><button class="btn small danger" data-act="delete">删除</button></td></tr>`;
-  }).join("") || '<tr><td colspan="6" class="muted empty-row">还没有资源。点击右上角“添加资源”，填写 Foundry 资源的端点和 API Key。</td></tr>';
+  }).join("") || '<tr><td colspan="7" class="muted empty-row">还没有资源。点击右上角“添加资源”，填写 Foundry 资源的端点和 API Key。</td></tr>';
 }
 $("#resource-body").addEventListener("click", async (e) => {
   const act = e.target.closest("button")?.dataset.act;
@@ -656,7 +766,7 @@ $("#resource-body").addEventListener("click", async (e) => {
   const id = Number(e.target.closest("tr").dataset.id);
   const r = state.resources.find((x) => x.id === id);
   if (act === "models") {
-    Object.assign(state.filter, { resource: String(id), status: "", abnormal: false, search: "" });
+    Object.assign(state.filter, { resource: String(id), status: "", abnormal: false, search: "", view: "list" });
     saveFilters();
     $("#f-search").value = "";
     $("#f-abnormal").checked = false;
@@ -684,7 +794,10 @@ function openResourceDialog(r) {
   if (r) {
     f.name.value = r.name;
     f.endpoint.value = r.endpoint;
+    f.region.value = r.region || "";
   }
+  const regions = [...new Set(state.resources.map((x) => x.region || x.name))].sort((a, b) => a.localeCompare(b, "zh"));
+  $("#region-options").innerHTML = regions.map((x) => `<option value="${esc(x)}"></option>`).join("");
   $("#resource-dialog").showModal();
 }
 $("#add-resource-btn").addEventListener("click", () => openResourceDialog(null));
@@ -692,7 +805,7 @@ $("#resource-cancel").addEventListener("click", () => $("#resource-dialog").clos
 $("#resource-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const f = e.target;
-  const body = { name: f.name.value, endpoint: f.endpoint.value, api_key: f.api_key.value || null };
+  const body = { name: f.name.value, endpoint: f.endpoint.value, api_key: f.api_key.value || null, region: f.region.value.trim() };
   try {
     if (state.editingResourceId) await api(`/api/resources/${state.editingResourceId}`, { method: "PUT", body });
     else await api("/api/resources", { method: "POST", body });

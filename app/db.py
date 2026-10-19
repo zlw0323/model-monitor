@@ -33,7 +33,8 @@ MODEL_COLUMNS = """
     incident_label TEXT,
     incident_since REAL,
     incident_ok INTEGER NOT NULL DEFAULT 0,
-    incident_cycles INTEGER NOT NULL DEFAULT 0
+    incident_cycles INTEGER NOT NULL DEFAULT 0,
+    base_model TEXT
 """
 
 # Columns added after the resources migration; ensured on every start for databases created in between.
@@ -45,6 +46,7 @@ MODEL_EXTRA_COLUMNS = (
     ("incident_since", "REAL"),
     ("incident_ok", "INTEGER NOT NULL DEFAULT 0"),
     ("incident_cycles", "INTEGER NOT NULL DEFAULT 0"),
+    ("base_model", "TEXT"),
 )
 
 SCHEMA = f"""
@@ -53,7 +55,8 @@ CREATE TABLE IF NOT EXISTS resources (
     name TEXT NOT NULL UNIQUE,
     endpoint TEXT NOT NULL,
     api_key_enc TEXT NOT NULL,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    region TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS models ({MODEL_COLUMNS});
 CREATE TABLE IF NOT EXISTS checks (
@@ -146,6 +149,8 @@ class Database:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(SCHEMA)
+            if "region" not in {r[1] for r in self._conn.execute("PRAGMA table_info(resources)")}:
+                self._conn.execute("ALTER TABLE resources ADD COLUMN region TEXT NOT NULL DEFAULT ''")
             model_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(models)")}
             if "resource_id" not in model_cols:
                 self._migrate_to_resources()
@@ -309,7 +314,8 @@ class Database:
     # ---- models ----
     _MODEL_FULL = (
         "SELECT m.*, r.name AS resource_name, r.endpoint AS resource_endpoint, r.api_key_enc AS api_key_enc, "
-        "COALESCE(m.endpoint_override, r.endpoint) AS endpoint FROM models m JOIN resources r ON r.id = m.resource_id"
+        "COALESCE(m.endpoint_override, r.endpoint) AS endpoint, COALESCE(NULLIF(r.region, ''), r.name) AS region "
+        "FROM models m JOIN resources r ON r.id = m.resource_id"
     )
 
     def get_model(self, model_id: int) -> dict[str, Any] | None:
