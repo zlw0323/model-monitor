@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field, field_validator
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import config, importer
+from . import config, importer, netcheck
 from .crypto import decrypt, encrypt, mask
 from .db import Database
 from .feishu import FeishuNotConfigured, Notice, is_webhook_url, mask_webhook
@@ -126,6 +126,10 @@ class SettingsIn(BaseModel):
     feishu_webhook_clear: bool = False
     feishu_secret: str | None = Field(None, max_length=200)
     feishu_secret_clear: bool = False
+
+
+class NetTestIn(BaseModel):
+    urls: str | None = Field(None, max_length=2000)  # unsaved form value; None = the saved setting
 
 
 class AlertDeleteIn(BaseModel):
@@ -355,7 +359,8 @@ def create_app(
         models = [serialize(m, mon, s, latest.get(m["id"]), avail.get(m["id"]), spark.get(m["id"], []))
                   for m in db.list_models()]
         resources = [{"id": r["id"], "name": r["name"], "model_count": r["model_count"]} for r in db.list_resources()]
-        return {"models": models, "resources": resources, "now": now}
+        return {"models": models, "resources": resources, "now": now,
+                "monitor": {"network_down_since": mon.outage_since}}
 
     @app.get("/api/models")
     def list_models(_: str = Depends(require_login), db: Database = Depends(db_dep), mon: Monitor = Depends(mon_dep)):
@@ -568,7 +573,7 @@ def create_app(
 
     # ---- settings ----
     def public_settings(db: Database) -> dict:
-        s = db.get_settings()
+        s = {k: v for k, v in db.get_settings().items() if not k.startswith("state_")}  # internal runtime state
         pw = s.pop("smtp_password_enc", "")
         hook = s.pop("feishu_webhook_enc", "")
         secret = s.pop("feishu_secret_enc", "")
@@ -611,6 +616,11 @@ def create_app(
                 out[k] = f"{fv:g}"
             elif k in TEXT_SETTINGS:
                 out[k] = str(v or "").strip()
+            elif k == "network_check_urls":
+                try:
+                    out[k] = ",".join(netcheck.parse_urls(str(v or "")))
+                except ValueError as e:
+                    raise HTTPException(422, str(e))
             elif k == "smtp_security":
                 if v not in ("ssl", "starttls", "none"):
                     raise HTTPException(422, "smtp_security 必须是 ssl / starttls / none")
@@ -679,6 +689,16 @@ def create_app(
         except Exception as e:
             raise HTTPException(502, f"发送失败：{type(e).__name__}: {e}")
         return {"ok": True}
+
+    @app.post("/api/settings/test-network")
+    async def test_network(body: NetTestIn, _: str = Depends(require_login), db: Database = Depends(db_dep)):
+        raw = body.urls if body.urls is not None else db.get_settings().get("network_check_urls", "")
+        try:
+            urls = netcheck.parse_urls(raw)
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+        ok, details = await netcheck.check(urls)
+        return {"ok": ok, "details": details}
 
     # ---- frontend ----
     @app.middleware("http")

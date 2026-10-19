@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS checks (
     error TEXT,
     concurrent INTEGER,
     interfered INTEGER NOT NULL DEFAULT 0,
-    exclusive INTEGER NOT NULL DEFAULT 0
+    exclusive INTEGER NOT NULL DEFAULT 0,
+    net_down INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_checks_model_ts ON checks(model_id, ts);
 CREATE INDEX IF NOT EXISTS idx_checks_ts ON checks(ts);
@@ -167,6 +168,7 @@ class Database:
                 ("concurrent", "INTEGER"),
                 ("interfered", "INTEGER NOT NULL DEFAULT 0"),
                 ("exclusive", "INTEGER NOT NULL DEFAULT 0"),
+                ("net_down", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if col not in check_cols:
                     self._conn.execute(f"ALTER TABLE checks ADD COLUMN {col} {ddl}")
@@ -364,7 +366,8 @@ class Database:
         )
 
     def latest_check(self, model_id: int) -> dict[str, Any] | None:
-        return self.one("SELECT * FROM checks WHERE model_id = ? ORDER BY ts DESC, id DESC LIMIT 1", (model_id,))
+        return self.one("SELECT * FROM checks WHERE model_id = ? AND net_down = 0 ORDER BY ts DESC, id DESC LIMIT 1",
+                        (model_id,))
 
     def auto_baseline(self, model: dict[str, Any], window: int, min_samples: int) -> tuple[float | None, int]:
         """Median TTFT of the most recent clean checks: successful, not anomalous, not overlapping an image probe."""
@@ -390,7 +393,7 @@ class Database:
     def latest_checks(self) -> dict[int, dict[str, Any]]:
         rows = self.all(
             "SELECT c.* FROM checks c JOIN ("
-            " SELECT (SELECT id FROM checks WHERE model_id = m.id ORDER BY ts DESC, id DESC LIMIT 1) AS cid"
+            " SELECT (SELECT id FROM checks WHERE model_id = m.id AND net_down = 0 ORDER BY ts DESC, id DESC LIMIT 1) AS cid"
             " FROM models m) x ON c.id = x.cid"
         )
         return {r["model_id"]: r for r in rows}
@@ -400,7 +403,8 @@ class Database:
         rows = self.all(
             "SELECT model_id, COUNT(*) AS n_long, SUM(ok) AS up_long, SUM(t >= ?) AS n_short, "
             "SUM(CASE WHEN t >= ? THEN ok ELSE 0 END) AS up_short FROM ("
-            " SELECT model_id, MAX(success) AS ok, MIN(ts) AS t FROM checks WHERE ts >= ? GROUP BY model_id, cycle_id"
+            " SELECT model_id, MAX(success) AS ok, MIN(ts) AS t FROM checks WHERE ts >= ? AND net_down = 0"
+            " GROUP BY model_id, cycle_id"
             ") GROUP BY model_id",
             (since_short, since_short, since_long),
         )
@@ -417,7 +421,7 @@ class Database:
     def sparklines(self, since: float, max_points: int) -> dict[int, list[list]]:
         """Recent first-attempt results per model as [ts, ttft_ms | None, flag] (flag 0 ok, 1 anomaly, 2 failed)."""
         rows = self.all(
-            "SELECT model_id, ts, ttft_ms, success, anomaly FROM checks WHERE ts >= ? AND attempt = 0 "
+            "SELECT model_id, ts, ttft_ms, success, anomaly FROM checks WHERE ts >= ? AND attempt = 0 AND net_down = 0 "
             "ORDER BY model_id, ts",
             (since,),
         )
@@ -433,12 +437,18 @@ class Database:
         """Share of check cycles (scheduled + manual) that eventually succeeded."""
         row = self.one(
             "SELECT COUNT(*) AS n, SUM(ok) AS up FROM ("
-            " SELECT MAX(success) AS ok FROM checks WHERE model_id = ? AND ts >= ? GROUP BY cycle_id)",
+            " SELECT MAX(success) AS ok FROM checks WHERE model_id = ? AND ts >= ? AND net_down = 0 GROUP BY cycle_id)",
             (model_id, since),
         )
         if not row or not row["n"]:
             return None, 0
         return row["up"] / row["n"] * 100, row["n"]
+
+    def count_net_down_checks(self, after_id: int) -> int:
+        return self.one("SELECT COUNT(*) AS n FROM checks WHERE net_down = 1 AND id > ?", (after_id,))["n"]
+
+    def max_check_id(self) -> int:
+        return self.one("SELECT COALESCE(MAX(id), 0) AS n FROM checks")["n"]
 
     def purge_older_than(self, cutoff: float) -> None:
         self.execute("DELETE FROM checks WHERE ts < ?", (cutoff,))

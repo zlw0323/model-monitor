@@ -34,6 +34,7 @@
 
     <main>
       <div id="tab-dashboard" class="tab">
+        <div id="net-banner" class="net-banner hidden" role="alert"></div>
         <div class="summary chips" id="summary"></div>
         <div class="toolbar">
           <div class="filters">
@@ -143,6 +144,21 @@
           <p class="muted">各模型的检测时间会在检测间隔内自动错开。与图像检测同时进行的样本标记为“受干扰”，不计入基线；TTFT 超标时的重测会暂停其他检测、单独进行。单个模型可以在编辑页覆盖阈值、设置手动基线。</p>
           <p class="muted">报警规则：同一异常只报警一次，报错内容变化时再报一次，恢复需连续多轮正常才发恢复通知。新报警会等待一段时间（期间又有新报警则继续等待，最长 5 分钟），然后按资源合并成一条消息发送。出现认证失败、网络不通、5xx 等资源级错误时，会立即检测同一资源下的其他模型，使它们的报警进入同一条消息。</p>
           <div class="actions"><button class="btn primary" type="submit">保存</button><span class="msg"></span></div>
+        </form>
+
+        <form id="network-settings-form" method="post" action="/api/form-fallback" class="card">
+          <h2>监控端网络检测</h2>
+          <div class="form-grid">
+            <label class="span2">参考地址（逗号或换行分隔，最多 5 个）
+              <textarea name="network_check_urls" rows="3" required spellcheck="false"></textarea>
+            </label>
+          </div>
+          <p class="muted small">模型出现连接失败、超时、502/503/504 时，先访问这些与模型无关的地址：任意一个能访问就说明监控服务器网络正常，按模型故障处理；全部不可访问则判定为监控端自身断网——只发一条“监控端网络中断”报警，暂停模型检测，期间结果不计入可用率，网络恢复后发恢复通知并继续检测。建议同时填写境内外各一个地址。</p>
+          <div class="actions">
+            <button class="btn primary" type="submit">保存</button>
+            <button class="btn" type="button" id="test-network-btn">测试网络检测</button>
+            <span class="msg"></span>
+          </div>
         </form>
 
         <form id="smtp-settings-form" method="post" action="/api/form-fallback" class="card">

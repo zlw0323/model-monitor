@@ -16,9 +16,13 @@ def make_client(tmp_path):
     async def feishu(settings, notice):
         pass
 
+    async def network():
+        return True, []
+
     app = create_app(
         db_path=tmp_path / "api.db",
-        monitor_factory=lambda db: Monitor(db, probe_fn=probe, mail_fn=mail, feishu_fn=feishu, tick_seconds=0.05),
+        monitor_factory=lambda db: Monitor(db, probe_fn=probe, mail_fn=mail, feishu_fn=feishu, network_fn=network,
+                                           tick_seconds=0.05),
     )
     return TestClient(app)
 

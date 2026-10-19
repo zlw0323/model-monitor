@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from . import config
+from . import config, netcheck
 from .crypto import decrypt
 from .db import Database
 from .feishu import FeishuNotConfigured, Notice
@@ -26,10 +26,12 @@ log = logging.getLogger("monitor")
 ProbeFn = Callable[[dict[str, Any], str], Awaitable[ProbeResult]]
 MailFn = Callable[[dict[str, str], str, str], Awaitable[None]]
 FeishuFn = Callable[[dict[str, str], Notice], Awaitable[None]]
+NetworkFn = Callable[[], Awaitable[tuple[bool, list[str]]]]
 
 KIND_LABEL = {"text": "文本/推理模型", "image": "图像模型"}
 TRIGGER_LABEL = {"schedule": "定时", "manual": "手动", "fanout": "联动"}
-ALERT_KIND_LABEL = {"down": "连通失败", "slow": "TTFT 异常", "changed": "异常变化", "recovered": "恢复"}
+ALERT_KIND_LABEL = {"down": "连通失败", "slow": "TTFT 异常", "changed": "异常变化", "recovered": "恢复",
+                    "net_down": "监控端网络中断", "net_up": "监控端网络恢复"}
 CHANNELS = ("email", "feishu")
 # Delay before each retry of a failed alert delivery; the last value repeats until we give up.
 RETRY_BACKOFF = (30, 60, 120, 300, 600)
@@ -40,6 +42,10 @@ MERGED_MAX_LINES = 50
 # After the first normal cycle of an incident, confirm the recovery this soon instead of a whole interval later.
 RECOVERY_RECHECK_SECONDS = 300
 FANOUT_COOLDOWN_SECONDS = 1800
+NET_CHECK_CACHE_SECONDS = 30
+NETWORK_CODES = {"connect", "timeout", "disconnected", "http502", "http503", "http504"}
+NET_KINDS = {"net_down", "net_up"}
+MONITOR_SELF = "监控端"
 # Each probe may make two requests (token-parameter / image-format fallback), each with its own timeout.
 PROBE_HARD_LIMIT_SECONDS = {
     "text": 2 * config.TEXT_TIMEOUT_SECONDS + 30,
@@ -67,20 +73,28 @@ class Monitor:
         probe_fn: ProbeFn | None = None,
         mail_fn: MailFn | None = None,
         feishu_fn: FeishuFn | None = None,
+        network_fn: NetworkFn | None = None,
         tick_seconds: float = 5,
     ):
         self.db = db
         self._probe_override = probe_fn
         self._mail = mail_fn or send_mail
         self._feishu = feishu_fn or send_feishu
+        self._network_override = network_fn
         self._tick_seconds = tick_seconds
         self._running: dict[int, asyncio.Task] = {}
         self._queued: set[int] = set()
         self._loop_task: asyncio.Task | None = None
         self._retry_task: asyncio.Task | None = None
         self._flush_task: asyncio.Task | None = None
+        self._net_task: asyncio.Task | None = None
         self._fanout_at: dict[int, float] = {}
         self._send_lock = asyncio.Lock()
+        self._net_lock = asyncio.Lock()
+        self._net_cache: tuple[float, bool, list[str]] = (0.0, True, [])
+        since = (db.get_settings().get("state_net_down_since") or "").strip()
+        # When the monitor's own network is down: survives restarts, so an outage is reported once.
+        self.outage_since: float | None = float(since) if since else None
         self._last_purge = 0.0
         self._limits_cache: tuple[float, dict[str, int]] = (0.0, {})
         self.gate = ProbeGate(self._current_limits)
@@ -112,7 +126,8 @@ class Monitor:
                 self.db.update_model(m["id"], {"next_run_at": next_slot(m["id"], m["interval_minutes"], now)})
 
     async def stop(self) -> None:
-        tasks = [t for t in (self._loop_task, self._retry_task, self._flush_task, *self._running.values()) if t]
+        tasks = [t for t in (self._loop_task, self._retry_task, self._flush_task, self._net_task,
+                             *self._running.values()) if t]
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -127,8 +142,12 @@ class Monitor:
 
     def tick(self) -> None:
         now = time.time()
-        for m in self.db.due_models(now):
-            self.trigger(m["id"], "schedule")
+        if self.outage_since is None:
+            for m in self.db.due_models(now):
+                self.trigger(m["id"], "schedule")
+        elif self._net_task is None or self._net_task.done():
+            # Our own network is down: model checks would only fail, so just watch for it to come back.
+            self._net_task = asyncio.create_task(self.network_ok())
         settings = self.db.get_settings()
         if (self._flush_task is None or self._flush_task.done()) and self._flush_due(now, settings):
             self._flush_task = asyncio.create_task(self.flush_alerts())
@@ -249,6 +268,8 @@ class Monitor:
             finally:
                 self._queued.discard(model_id)
             verdict = classify(r, baseline, pct)
+            # A network-type failure may be our own network rather than the model: check before blaming the model.
+            net_down = verdict == "down" and _network_class(r) and not await self.network_ok(since=ts)
             self.db.insert_check(
                 {
                     "model_id": model_id,
@@ -262,12 +283,15 @@ class Monitor:
                     "total_ms": r.total_ms,
                     "anomaly": int(verdict != "ok"),
                     "baseline_ms": baseline,
-                    "error": r.error,
+                    "error": f"监控端网络异常，本次不计入：{r.error}" if net_down else r.error,
                     "concurrent": slot.concurrent,
                     "interfered": int(slot.interfered),
                     "exclusive": int(exclusive),
+                    "net_down": int(net_down),
                 }
             )
+            if net_down:
+                return  # the model's status, incident and stats stay as they were
             attempts.append((r, verdict, ts, exclusive))
             if verdict == "ok":
                 break
@@ -275,6 +299,63 @@ class Monitor:
         final = attempts[-1][1]
         self.db.refresh_baseline_cache([model_id], int(settings["baseline_window"]), int(settings["baseline_min_samples"]))
         self._handle_outcome(m, final, attempts, baseline, pct, trigger, settings)
+
+    # ---- monitor-side network ----
+    async def network_ok(self, since: float | None = None) -> bool:
+        """Can the monitor reach the internet at all? A result is reused only if that check started after
+        `since` (default: within the last 30 s), so a failure is never explained away by an "online" result
+        from before it happened. Concurrent callers share one check.
+        Entering and leaving the outage state (and its two alerts) happens here."""
+        since = time.time() - NET_CHECK_CACHE_SECONDS if since is None else since
+        if self._net_cache[0] > since:
+            return self._net_cache[1]
+        async with self._net_lock:
+            started, ok, details = self._net_cache
+            if started <= since:
+                started = time.time()
+                if self._network_override:
+                    ok, details = await self._network_override()
+                else:
+                    try:
+                        urls = netcheck.parse_urls(self.db.get_settings().get("network_check_urls", ""))
+                    except ValueError:
+                        urls = netcheck.parse_urls(netcheck.DEFAULT_URLS)
+                    ok, details = await netcheck.check(urls, first_ok=True)
+                self._net_cache = (started, ok, details)
+            if not ok and self.outage_since is None:
+                self._enter_outage(details)
+            elif ok and self.outage_since is not None:
+                self._exit_outage()
+            return ok
+
+    def _enter_outage(self, details: list[str]) -> None:
+        now = time.time()
+        self.outage_since = now
+        self.db.set_settings({"state_net_down_since": str(now), "state_net_down_after_check": str(self.db.max_check_id())})
+        log.warning("monitor network is down: %s", "; ".join(details))
+        title = "[模型监控][监控端异常] 监控服务器网络中断"
+        summary = ("监控服务器无法访问外部网络：所有参考地址都不可访问。\n"
+                   "这是监控端自身的网络问题，不是模型故障。期间暂停模型检测和报警，检测结果不计入可用率；网络恢复后自动继续。")
+        notice = Notice("down", title, summary, [("开始时间", fmt_ts(now))], details, f"时区：{config.APP_TZ.key}")
+        self.db.insert_alert(None, "net_down", title, render_text(notice), notice.to_json(), model_name=MONITOR_SELF,
+                             brief="监控端网络中断 · 参考地址均不可访问", queued=True)
+
+    def _exit_outage(self) -> None:
+        since, now = self.outage_since or time.time(), time.time()
+        self.outage_since = None
+        after = self.db.get_settings().get("state_net_down_after_check") or "0"
+        self.db.set_settings({"state_net_down_since": "", "state_net_down_after_check": ""})
+        skipped = self.db.count_net_down_checks(int(after) if after.isdigit() else 0)
+        duration = fmt_duration(now - since)
+        log.warning("monitor network is back after %s", duration)
+        title = "[模型监控][监控端恢复] 监控服务器网络已恢复"
+        summary = (f"监控服务器网络已恢复，中断 {duration}（{fmt_ts(since)} ~ {fmt_ts(now)[11:]}），"
+                   f"期间有 {skipped} 次检测因断网未计入。各模型会在一个检测间隔内陆续恢复检测。")
+        facts = [("中断时长", duration), ("未计入的检测", f"{skipped} 次")]
+        notice = Notice("recovered", title, summary, facts, [], f"时区：{config.APP_TZ.key}")
+        self.db.insert_alert(None, "net_up", title, render_text(notice), notice.to_json(), model_name=MONITOR_SELF,
+                             brief=f"监控端网络恢复 · 中断 {duration}", queued=True)
+        self.realign_schedule()  # resume on each model's own slot instead of all at once
 
     # ---- incidents ----
     def _handle_outcome(self, m, final, attempts, baseline, pct, trigger, settings) -> None:
@@ -434,9 +515,12 @@ class Monitor:
         title = f"[模型监控] {len(rows)} 条报警合并：{parts}" + ("（含补发）" if resend_ids else "")
         by_res: dict[str, list[dict]] = {}
         for a in rows:
-            by_res.setdefault(a.get("resource_name") or "-", []).append(a)
+            by_res.setdefault(MONITOR_SELF if a["kind"] in NET_KINDS else a.get("resource_name") or "-", []).append(a)
         summary_lines = []
         for res, items in by_res.items():
+            if all(a["kind"] in NET_KINDS for a in items):
+                summary_lines.append("监控端：" + "；".join(a.get("brief") or a["subject"] for a in items))
+                continue
             c = "，".join(f"{ALERT_KIND_LABEL[k]} {n} 个" for k in ALERT_KIND_LABEL
                          if (n := sum(1 for a in items if a["kind"] == k)))
             reasons = {(a.get("brief") or "").split(" · ", 1)[-1] for a in items if a["kind"] == "down"}
@@ -512,6 +596,14 @@ class Monitor:
                 line += f"，错误：{r.error}"
             details.append(line)
         return Notice(kind, title, summary, facts, details, f"时区：{config.APP_TZ.key}"), brief
+
+
+def _network_class(r: ProbeResult) -> bool:
+    """Failures that might be the monitor's own network rather than the model."""
+    try:
+        return describe(r).code in NETWORK_CODES
+    except Exception:
+        return False
 
 
 def fmt_duration(seconds: float) -> str:

@@ -9,7 +9,7 @@ const STATUS = {
   down: { label: "连通失败", cls: "bad" },
   unknown: { label: "未检测", cls: "muted" },
 };
-const ALERT_KIND = { down: "连通失败", slow: "TTFT 异常", changed: "异常变化", recovered: "恢复" };
+const ALERT_KIND = { down: "连通失败", slow: "TTFT 异常", changed: "异常变化", recovered: "恢复", net_down: "监控端网络中断", net_up: "监控端网络恢复" };
 const KIND = { text: "文本/推理", image: "图像" };
 
 const state = { models: [], resources: [], editingId: null, editingResourceId: null, detailId: null, timer: null };
@@ -148,12 +148,22 @@ async function loadDashboard() {
   }
   state.models = data.models;
   state.resList = data.resources;
+  renderNetBanner(data.monitor && data.monitor.network_down_since);
   const ids = new Set(state.models.map((m) => m.id));
   for (const id of [...state.selected]) if (!ids.has(id)) state.selected.delete(id);
   renderResourceFilter();
   renderSummary();
   renderTable();
   if (state.detailId && $("#detail-dialog").open) refreshDetail();
+}
+
+function renderNetBanner(since) {
+  state.netDown = Boolean(since);
+  const el = $("#net-banner");
+  el.classList.toggle("hidden", !since);
+  if (since) {
+    el.innerHTML = `<b>监控端网络中断</b>（自 ${fmtTime(since)} 起）：监控服务器无法访问外部网络，模型检测已暂停，期间结果不计入可用率。网络恢复后会自动继续检测并发送恢复通知。`;
+  }
 }
 
 function renderResourceFilter() {
@@ -279,7 +289,7 @@ function renderTable() {
       <td class="num">${fmtPct(m.availability_24h)}</td>
       <td class="num">${fmtPct(m.availability_7d)}</td>
       <td>${sparkSvg(m)}</td>
-      <td class="small nowrap" title="${fmtTime(m.last_check_at)}">${relTime(m.last_check_at)}<div class="muted">${m.enabled ? `下次 ${relTime(m.next_run_at)}` : ""}</div></td>
+      <td class="small nowrap" title="${fmtTime(m.last_check_at)}">${relTime(m.last_check_at)}<div class="muted">${!m.enabled ? "" : state.netDown ? "已暂停（监控端断网）" : `下次 ${relTime(m.next_run_at)}`}</div></td>
       <td class="col-actions nowrap">
         <button class="btn small" data-act="run">检测</button><button class="btn small" data-act="detail">详情</button><button class="btn small" data-act="edit">编辑</button><button class="btn small danger" data-act="delete">删除</button>
       </td></tr>`;
@@ -391,6 +401,7 @@ function chartConfig(m, checks) {
   const okPts = [], anomalyPts = [], failPts = [];
   for (const c of checks) {
     const x = c.ts * 1000;
+    if (c.net_down) continue; // the monitor's own network was down: says nothing about the model
     if (!c.success) failPts.push({ x, y: 0, c });
     else if (c.anomaly) anomalyPts.push({ x, y: c.ttft_ms, c });
     else okPts.push({ x, y: c.ttft_ms, c });
@@ -463,7 +474,8 @@ async function refreshDetail() {
   detailChart = new Chart($("#detail-chart"), chartConfig(m, checks));
   const trig = { schedule: "定时", manual: "手动", fanout: "联动" };
   $("#detail-body").innerHTML = [...checks].reverse().slice(0, 300).map((c) => {
-    const res = !c.success ? '<span class="badge bad">失败</span>' : c.anomaly ? '<span class="badge warn">超标</span>' : '<span class="badge ok">正常</span>';
+    const res = c.net_down ? '<span class="badge muted" title="监控服务器自身断网，不计入可用率和趋势">监控端断网</span>'
+      : !c.success ? '<span class="badge bad">失败</span>' : c.anomaly ? '<span class="badge warn">超标</span>' : '<span class="badge ok">正常</span>';
     const round = (c.attempt ? `重测 ${c.attempt}` : "首次") + (c.exclusive ? ' <span class="badge info" title="暂停其他检测后单独测量">独占</span>' : "");
     const conc = c.concurrent == null ? "-"
       : c.interfered ? `<span class="badge warn" title="与图像检测同时进行，不计入基线">${c.concurrent} · 受干扰</span>`
@@ -723,7 +735,7 @@ async function loadAlerts() {
   const keep = new Set(selectedAlertIds());
   alertsCache = await api("/api/alerts").catch(() => alertsCache);
   $("#alerts-body").innerHTML = alertsCache.map((a, i) => {
-    const cls = a.kind === "recovered" ? "ok" : a.kind === "down" ? "bad" : "warn";
+    const cls = a.kind === "recovered" || a.kind === "net_up" ? "ok" : a.kind === "down" || a.kind === "net_down" ? "bad" : "warn";
     return `<tr data-row="${a.id}"><td class="col-check"><input type="checkbox" data-id="${a.id}" aria-label="选择"></td>
       <td class="nowrap">${fmtTime(a.ts)}</td><td class="nowrap">${esc(a.model_name || "(已删除)")}${a.resource_name ? `<div class="muted small">${esc(a.resource_name)}</div>` : ""}</td>
       <td><span class="badge ${cls}">${ALERT_KIND[a.kind] || a.kind}</span></td>
@@ -789,12 +801,14 @@ async function loadSettings() {
   fs.feishu_secret.placeholder = s.feishu_secret_set ? "已保存，留空保持不变" : "未设置（机器人开启签名校验时必填）";
   fs.feishu_webhook_clear.checked = false;
   fs.feishu_secret_clear.checked = false;
+  $("#network-settings-form").network_check_urls.value = (s.network_check_urls || "").split(",").join("\n");
 }
 function flash(form, text, isError) {
   const el = $(".msg", form);
   el.textContent = text;
   el.className = `msg ${isError ? "error" : "success"}`;
-  setTimeout(() => (el.textContent = ""), 5000);
+  clearTimeout(el._timer); // an earlier "sending…" message must not wipe out the result
+  el._timer = setTimeout(() => (el.textContent = ""), isError ? 10000 : 5000);
 }
 $("#monitor-settings-form").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -858,6 +872,27 @@ $("#test-feishu-btn").addEventListener("click", async () => {
   try {
     await api("/api/settings/test-feishu", { method: "POST" });
     flash(f, "测试消息已发送，请在飞书群中查看");
+  } catch (err) {
+    flash(f, err.message, true);
+  }
+});
+$("#network-settings-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  try {
+    await api("/api/settings", { method: "PUT", body: { values: { network_check_urls: f.network_check_urls.value } } });
+    await loadSettings();
+    flash(f, "已保存");
+  } catch (err) {
+    flash(f, err.message, true);
+  }
+});
+$("#test-network-btn").addEventListener("click", async () => {
+  const f = $("#network-settings-form");
+  flash(f, "检测中…");
+  try {
+    const r = await api("/api/settings/test-network", { method: "POST", body: { urls: f.network_check_urls.value } });
+    flash(f, `${r.ok ? "网络正常" : "全部不可访问（会判定为监控端断网）"}：${r.details.join("；")}`, !r.ok);
   } catch (err) {
     flash(f, err.message, true);
   }

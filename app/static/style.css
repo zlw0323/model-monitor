@@ -100,6 +100,7 @@ details.advanced summary { cursor: pointer; color: var(--muted); font-size: 13px
 #import-msg { margin: 8px 0; min-height: 1em; }
 
 input, select { width: 100%; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; font-size: 14px; background: #fff; }
+.form-grid textarea { width: 100%; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; font-family: Consolas, monospace; font-size: 13px; resize: vertical; }
 label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: #374151; }
 label.checkbox { flex-direction: row; align-items: center; gap: 6px; }
 label.checkbox input { width: auto; }
@@ -115,6 +116,7 @@ label.checkbox input { width: auto; }
 .topbar nav a { color: #d1d5db; text-decoration: none; padding: 6px 12px; border-radius: 6px; }
 .topbar nav a.active, .topbar nav a:hover { background: #374151; color: #fff; }
 main { padding: 20px 24px; max-width: 1600px; margin: 0 auto; }
+.net-banner { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; border-radius: 8px; padding: 10px 14px; margin-bottom: 16px; font-size: 14px; }
 
 .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; gap: 12px; flex-wrap: wrap; }
 .toolbar-right { display: flex; gap: 8px; }

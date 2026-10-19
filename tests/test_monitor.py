@@ -27,7 +27,10 @@ class Harness:
         self.mails = []
         self.notices = []
         self.calls = 0
-        self.monitor = Monitor(self.db, probe_fn=self._probe, mail_fn=self._mail, feishu_fn=self._feishu)
+        self.net_up = True  # what the monitor-side network check reports
+        self.net_calls = 0
+        self.monitor = Monitor(self.db, probe_fn=self._probe, mail_fn=self._mail, feishu_fn=self._feishu,
+                               network_fn=self._network)
         self.resource_id = self.db.insert_resource(
             {"name": "r", "endpoint": "https://r.openai.azure.com/", "api_key_enc": encrypt("k")}
         )
@@ -45,6 +48,12 @@ class Harness:
 
     async def _feishu(self, settings, notice):
         self.notices.append(notice)
+
+    async def _network(self):
+        self.net_calls += 1
+        if self.net_up:
+            return True, ["ref.example：可访问（HTTP 200）"]
+        return False, ["ref.example：不可访问（ConnectError）"]
 
     def cycle(self, *results, model_id=None, flush=True):
         self.queue.extend(results)

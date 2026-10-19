@@ -40,6 +40,10 @@ DEFAULT_SETTINGS = {
     "alert_merge_seconds": "60",
     "recovery_confirm_cycles": "2",
     "alert_fanout": "1",
+    "network_check_urls": "https://www.cloudflare.com/cdn-cgi/trace,https://www.microsoft.com/,https://www.baidu.com/",
+    # Runtime state (not user settings): when the monitor's own network went down, empty when online.
+    "state_net_down_since": "",
+    "state_net_down_after_check": "",
     "smtp_host": "",
     "smtp_port": "465",
     "smtp_security": "ssl",
