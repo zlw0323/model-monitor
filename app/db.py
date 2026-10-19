@@ -26,8 +26,26 @@ MODEL_COLUMNS = """
     status TEXT NOT NULL DEFAULT 'unknown',
     last_check_at REAL,
     next_run_at REAL,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    incident_kind TEXT,
+    incident_sig TEXT,
+    incident_sigs TEXT,
+    incident_label TEXT,
+    incident_since REAL,
+    incident_ok INTEGER NOT NULL DEFAULT 0,
+    incident_cycles INTEGER NOT NULL DEFAULT 0
 """
+
+# Columns added after the resources migration; ensured on every start for databases created in between.
+MODEL_EXTRA_COLUMNS = (
+    ("incident_kind", "TEXT"),
+    ("incident_sig", "TEXT"),
+    ("incident_sigs", "TEXT"),
+    ("incident_label", "TEXT"),
+    ("incident_since", "REAL"),
+    ("incident_ok", "INTEGER NOT NULL DEFAULT 0"),
+    ("incident_cycles", "INTEGER NOT NULL DEFAULT 0"),
+)
 
 SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS resources (
@@ -71,7 +89,11 @@ CREATE TABLE IF NOT EXISTS alerts (
     email_tries INTEGER NOT NULL DEFAULT 0,
     email_retry_at REAL,
     feishu_tries INTEGER NOT NULL DEFAULT 0,
-    feishu_retry_at REAL
+    feishu_retry_at REAL,
+    model_name TEXT,
+    resource_name TEXT,
+    brief TEXT,
+    queued INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts);
 CREATE TABLE IF NOT EXISTS settings (
@@ -126,6 +148,19 @@ class Database:
             model_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(models)")}
             if "resource_id" not in model_cols:
                 self._migrate_to_resources()
+            model_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(models)")}
+            for col, ddl in MODEL_EXTRA_COLUMNS:
+                if col not in model_cols:
+                    self._conn.execute(f"ALTER TABLE models ADD COLUMN {col} {ddl}")
+            # Models already alarmed before incident tracking existed: treat that as an open, already-notified
+            # incident, so the upgrade doesn't re-send an alert for a problem the team already knows about.
+            for kind in ("down", "slow"):
+                self._conn.execute(
+                    "UPDATE models SET incident_kind = ?, incident_sig = ?, incident_sigs = ?, incident_label = ?, "
+                    "incident_since = COALESCE(last_check_at, ?), incident_cycles = 1 "
+                    "WHERE status = ? AND incident_kind IS NULL",
+                    (kind, f"legacy:{kind}", f'["legacy:{kind}"]', "升级前已报警", time.time(), kind),
+                )
             self._conn.execute("CREATE INDEX IF NOT EXISTS idx_models_resource ON models(resource_id)")
             check_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(checks)")}
             for col, ddl in (
@@ -143,6 +178,10 @@ class Database:
                 ("email_retry_at", "REAL"),
                 ("feishu_tries", "INTEGER NOT NULL DEFAULT 0"),
                 ("feishu_retry_at", "REAL"),
+                ("model_name", "TEXT"),
+                ("resource_name", "TEXT"),
+                ("brief", "TEXT"),
+                ("queued", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if col not in cols:
                     self._conn.execute(f"ALTER TABLE alerts ADD COLUMN {col} {ddl}")
@@ -406,13 +445,24 @@ class Database:
         self.execute("DELETE FROM alerts WHERE ts < ?", (cutoff,))
 
     # ---- alerts ----
-    def insert_alert(self, model_id: int | None, kind: str, subject: str, message: str, notice_json: str = "") -> int:
+    def insert_alert(self, model_id: int | None, kind: str, subject: str, message: str, notice_json: str = "",
+                     model_name: str | None = None, resource_name: str | None = None, brief: str | None = None,
+                     queued: bool = False) -> int:
+        status = "待合并发送" if queued else "发送中"
         cur = self.execute(
-            "INSERT INTO alerts (model_id, ts, kind, subject, message, email_status, feishu_status, notice_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (model_id, time.time(), kind, subject, message, "发送中", "发送中", notice_json or None),
+            "INSERT INTO alerts (model_id, ts, kind, subject, message, email_status, feishu_status, notice_json, "
+            "model_name, resource_name, brief, queued) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (model_id, time.time(), kind, subject, message, status, status, notice_json or None,
+             model_name, resource_name, brief, int(queued)),
         )
         return int(cur.lastrowid)
+
+    def queued_alerts(self) -> list[dict[str, Any]]:
+        return self.all("SELECT * FROM alerts WHERE queued = 1 ORDER BY ts, id")
+
+    def retry_pending(self, channel: str) -> list[dict[str, Any]]:
+        col = {"email": "email_retry_at", "feishu": "feishu_retry_at"}[channel]
+        return self.all(f"SELECT * FROM alerts WHERE {col} IS NOT NULL ORDER BY ts, id")
 
     def get_alert(self, alert_id: int) -> dict[str, Any] | None:
         return self.one("SELECT * FROM alerts WHERE id = ?", (alert_id,))
@@ -431,18 +481,6 @@ class Database:
             "SELECT * FROM alerts WHERE email_retry_at <= ? OR feishu_retry_at <= ? ORDER BY ts, id", (now, now)
         )
 
-    def pending_alerts(self, model_id: int, exclude_id: int) -> list[dict[str, Any]]:
-        return self.all(
-            "SELECT * FROM alerts WHERE model_id = ? AND id != ? "
-            "AND (email_retry_at IS NOT NULL OR feishu_retry_at IS NOT NULL) ORDER BY ts, id",
-            (model_id, exclude_id),
-        )
-
-    def expedite_retries(self, channel: str, now: float) -> None:
-        """Channel works again: make every pending retry on it due immediately."""
-        col = {"email": "email_retry_at", "feishu": "feishu_retry_at"}[channel]
-        self.execute(f"UPDATE alerts SET {col} = ? WHERE {col} > ?", (now, now))
-
     def delete_alerts(self, ids: list[int] | None) -> int:
         """Delete the given alerts, or all alerts when ids is None."""
         if ids is None:
@@ -454,8 +492,9 @@ class Database:
 
     def list_alerts(self, limit: int = 200) -> list[dict[str, Any]]:
         return self.all(
-            "SELECT a.id, a.model_id, a.ts, a.kind, a.subject, a.message, a.email_status, a.feishu_status, "
-            "m.name AS model_name FROM alerts a LEFT JOIN models m ON m.id = a.model_id "
+            "SELECT a.id, a.model_id, a.ts, a.kind, a.subject, a.message, a.email_status, a.feishu_status, a.brief, "
+            "COALESCE(m.name, a.model_name) AS model_name, a.resource_name "
+            "FROM alerts a LEFT JOIN models m ON m.id = a.model_id "
             "ORDER BY a.ts DESC, a.id DESC LIMIT ?",
             (limit,),
         )

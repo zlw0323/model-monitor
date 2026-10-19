@@ -110,7 +110,7 @@
           </div>
           <div class="table-wrap">
           <table class="table alerts-table">
-            <thead><tr><th class="col-check"><input type="checkbox" id="alerts-check-all" title="全选" aria-label="全选"></th><th>时间</th><th>模型</th><th>类型</th><th>标题</th><th>邮件</th><th>飞书</th><th class="col-actions">操作</th></tr></thead>
+            <thead><tr><th class="col-check"><input type="checkbox" id="alerts-check-all" title="全选" aria-label="全选"></th><th>时间</th><th>模型</th><th>类型</th><th>内容</th><th>邮件</th><th>飞书</th><th class="col-actions">操作</th></tr></thead>
             <tbody id="alerts-body"></tbody>
           </table>
           </div>
@@ -131,8 +131,17 @@
             <label>文本模型最多同时检测数<input name="max_concurrent_text" type="number" min="1" max="50" required></label>
             <label>图像模型最多同时检测数<input name="max_concurrent_image" type="number" min="1" max="50" required></label>
             <label>同一 Azure 资源最多同时检测数<input name="max_concurrent_per_host" type="number" min="1" max="50" required></label>
+            <label>报警合并等待（秒，0=不等待）<input name="alert_merge_seconds" type="number" min="0" max="600" required></label>
+            <label>恢复确认（连续正常轮数）<input name="recovery_confirm_cycles" type="number" min="1" max="10" required></label>
+            <label>资源级故障时联动检测同资源模型
+              <select name="alert_fanout">
+                <option value="1">开启</option>
+                <option value="0">关闭</option>
+              </select>
+            </label>
           </div>
           <p class="muted">各模型的检测时间会在检测间隔内自动错开。与图像检测同时进行的样本标记为“受干扰”，不计入基线；TTFT 超标时的重测会暂停其他检测、单独进行。单个模型可以在编辑页覆盖阈值、设置手动基线。</p>
+          <p class="muted">报警规则：同一异常只报警一次，报错内容变化时再报一次，恢复需连续多轮正常才发恢复通知。新报警会等待一段时间（期间又有新报警则继续等待，最长 5 分钟），然后按资源合并成一条消息发送。出现认证失败、网络不通、5xx 等资源级错误时，会立即检测同一资源下的其他模型，使它们的报警进入同一条消息。</p>
           <div class="actions"><button class="btn primary" type="submit">保存</button><span class="msg"></span></div>
         </form>
 
@@ -266,16 +275,20 @@
 
   <!-- 模型详情 -->
   <dialog id="detail-dialog" class="wide">
-    <div class="detail-head">
-      <h2 id="detail-title"></h2>
-      <div>
-        <select id="detail-range" title="时间范围">
-          <option value="24">最近 24 小时</option>
-          <option value="168">最近 7 天</option>
-          <option value="720">最近 30 天</option>
-        </select>
-        <button class="btn" id="detail-reset-baseline">重置自动基线</button>
-        <button class="btn" id="detail-close">关闭</button>
+    <div class="dialog-head">
+      <div class="dialog-title"><h2 id="detail-title"></h2><span id="detail-status"></span></div>
+      <button class="icon-btn" id="detail-close" title="关闭" aria-label="关闭">✕</button>
+    </div>
+    <p class="muted" id="detail-meta"></p>
+    <div class="detail-toolbar">
+      <div class="segmented" id="detail-range" role="group" aria-label="时间范围">
+        <button type="button" data-hours="24" class="active">24 小时</button>
+        <button type="button" data-hours="168">7 天</button>
+        <button type="button" data-hours="720">30 天</button>
+      </div>
+      <div class="detail-actions">
+        <button class="btn small" id="detail-run">立即检测</button>
+        <button class="btn small" id="detail-reset-baseline" title="清空已学习的自动基线，用之后的检测结果重新学习">重置自动基线</button>
       </div>
     </div>
     <p class="muted" id="detail-meta"></p>

@@ -9,7 +9,7 @@ const STATUS = {
   down: { label: "连通失败", cls: "bad" },
   unknown: { label: "未检测", cls: "muted" },
 };
-const ALERT_KIND = { down: "连通失败", slow: "TTFT 异常", recovered: "恢复" };
+const ALERT_KIND = { down: "连通失败", slow: "TTFT 异常", changed: "异常变化", recovered: "恢复" };
 const KIND = { text: "文本/推理", image: "图像" };
 
 const state = { models: [], resources: [], editingId: null, editingResourceId: null, detailId: null, timer: null };
@@ -234,11 +234,15 @@ function sparkSvg(m) {
 
 function statusCell(m) {
   const st = effStatus(m);
+  const inc = m.incident;
+  const tip = inc ? `${inc.label || ""}，自 ${fmtTime(inc.since)} 起，已检测 ${inc.cycles} 轮异常（同一异常只报警一次）` : "";
   const badge = st === "disabled" ? '<span class="badge muted">已停用</span>'
-    : `<span class="badge ${(STATUS[st] || STATUS.unknown).cls}">${(STATUS[st] || STATUS.unknown).label}</span>`;
+    : `<span class="badge ${(STATUS[st] || STATUS.unknown).cls}" title="${esc(tip)}">${(STATUS[st] || STATUS.unknown).label}</span>`;
+  const confirming = inc && inc.ok > 0
+    ? `<span class="badge info" title="恢复需连续 ${inc.confirm_needed} 轮检测正常，确认后才发恢复通知">恢复确认中 ${inc.ok}/${inc.confirm_needed}</span>` : "";
   const activity = m.queued ? '<span class="badge muted" title="等待其他检测完成（并发上限或独占重测）">排队中</span>'
     : m.running ? '<span class="badge info">检测中</span>' : "";
-  return `${badge}${activity}`;
+  return `${badge}${confirming}${activity}`;
 }
 
 function ttftCell(m) {
@@ -391,7 +395,18 @@ function chartConfig(m, checks) {
     else if (c.anomaly) anomalyPts.push({ x, y: c.ttft_ms, c });
     else okPts.push({ x, y: c.ttft_ms, c });
   }
-  const line = [...okPts, ...anomalyPts].sort((a, b) => a.x - b.x);
+  // Break the line at failures and at long gaps in the data, instead of drawing a slope across an outage.
+  const gapMs = Math.max(3 * m.interval_minutes * 60e3, 30 * 60e3);
+  const line = [];
+  let prev = null;
+  for (const p of [...okPts, ...anomalyPts, ...failPts].sort((a, b) => a.x - b.x)) {
+    const failed = !p.c.success;
+    if (prev && (failed || p.x - prev.x > gapMs) && line.length && line[line.length - 1].y !== null) {
+      line.push({ x: failed ? p.x : (prev.x + p.x) / 2, y: null });
+    }
+    if (!failed) line.push(p);
+    prev = p;
+  }
   const xs = checks.map((c) => c.ts * 1000);
   const xMin = xs.length ? Math.min(...xs) : Date.now() - 3600e3;
   const xMax = xs.length ? Math.max(...xs) : Date.now();
@@ -434,16 +449,19 @@ function chartConfig(m, checks) {
 }
 
 let detailChart = null;
+state.detailHours = 24;
 async function refreshDetail() {
   const m = state.models.find((x) => x.id === state.detailId);
   if (!m) return;
-  const hours = Number($("#detail-range").value);
+  const hours = state.detailHours;
+  $$("#detail-range button").forEach((b) => b.classList.toggle("active", Number(b.dataset.hours) === hours));
   $("#detail-title").textContent = m.name;
+  $("#detail-status").innerHTML = statusCell(m);
   $("#detail-meta").innerHTML = `${KIND[m.kind]} · 资源 ${esc(m.resource_name)} · 部署 ${esc(m.deployment)}<br>请求地址：<code>${esc(m.request_url)}</code>${m.kind === "text" ? ` · token 参数：<code>${esc(m.token_param)}</code>` : ""}`;
   const checks = await api(`/api/models/${m.id}/checks?hours=${hours}`).catch(() => []);
   if (detailChart) detailChart.destroy();
   detailChart = new Chart($("#detail-chart"), chartConfig(m, checks));
-  const trig = { schedule: "定时", manual: "手动" };
+  const trig = { schedule: "定时", manual: "手动", fanout: "联动" };
   $("#detail-body").innerHTML = [...checks].reverse().slice(0, 300).map((c) => {
     const res = !c.success ? '<span class="badge bad">失败</span>' : c.anomaly ? '<span class="badge warn">超标</span>' : '<span class="badge ok">正常</span>';
     const round = (c.attempt ? `重测 ${c.attempt}` : "首次") + (c.exclusive ? ' <span class="badge info" title="暂停其他检测后单独测量">独占</span>' : "");
@@ -454,10 +472,23 @@ async function refreshDetail() {
       <td>${fmtMs(c.ttft_ms)}</td><td>${fmtMs(c.total_ms)}</td><td>${conc}</td><td>${c.http_status ?? "-"}</td><td class="err-cell" title="${esc(c.error)}">${esc(c.error || "")}</td></tr>`;
   }).join("") || '<tr><td colspan="9" class="muted">暂无数据</td></tr>';
 }
-$("#detail-range").addEventListener("change", refreshDetail);
-$("#detail-close").addEventListener("click", () => {
-  $("#detail-dialog").close();
-  state.detailId = null;
+$("#detail-range").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-hours]");
+  if (!b || Number(b.dataset.hours) === state.detailHours) return;
+  state.detailHours = Number(b.dataset.hours);
+  refreshDetail();
+});
+$("#detail-close").addEventListener("click", () => $("#detail-dialog").close());
+$("#detail-dialog").addEventListener("close", () => {
+  state.detailId = null; // also covers closing with Esc
+});
+$("#detail-run").addEventListener("click", async () => {
+  try {
+    await api(`/api/models/${state.detailId}/run`, { method: "POST" });
+  } catch (err) {
+    alert(err.message);
+  }
+  loadDashboard();
 });
 $("#detail-reset-baseline").addEventListener("click", async () => {
   if (!confirm("重置后将只使用之后的检测结果重新学习自动基线（手动基线不受影响）。继续？")) return;
@@ -677,23 +708,26 @@ function syncAlertSelection() {
 function deliveryBadge(status) {
   if (!status) return '<span class="badge muted">-</span>';
   const s = String(status);
-  const [cls, label] = s.startsWith("已发送") ? ["ok", "已发送"]
-    : s.startsWith("已补发") ? ["ok", "已补发"]
+  const merged = s.includes("合并") && !s.startsWith("待合并") ? " · 合并" : "";
+  const [cls, label] = s.startsWith("已发送") ? ["ok", "已发送" + merged]
+    : s.startsWith("已补发") ? ["ok", "已补发" + merged]
+    : s.startsWith("待合并") ? ["info", "合并中"]
     : s.startsWith("未发送") ? ["muted", "未配置"]
     : s.startsWith("发送中") ? ["info", "发送中"]
     : s.includes("将自动重试") ? ["warn", "待重试"]
     : ["bad", "失败"];
-  return `<span class="badge ${cls}" title="${esc(s)}">${label}</span>`;
+  const tip = s.startsWith("待合并") ? "同一时间段内的报警会合并成一条消息发送（见 设置 → 报警合并等待）" : s;
+  return `<span class="badge ${cls}" title="${esc(tip)}">${label}</span>`;
 }
 async function loadAlerts() {
   const keep = new Set(selectedAlertIds());
   alertsCache = await api("/api/alerts").catch(() => alertsCache);
   $("#alerts-body").innerHTML = alertsCache.map((a, i) => {
-    const cls = a.kind === "recovered" ? "ok" : a.kind === "slow" ? "warn" : "bad";
+    const cls = a.kind === "recovered" ? "ok" : a.kind === "down" ? "bad" : "warn";
     return `<tr data-row="${a.id}"><td class="col-check"><input type="checkbox" data-id="${a.id}" aria-label="选择"></td>
-      <td class="nowrap">${fmtTime(a.ts)}</td><td class="nowrap">${esc(a.model_name || "(已删除)")}</td>
+      <td class="nowrap">${fmtTime(a.ts)}</td><td class="nowrap">${esc(a.model_name || "(已删除)")}${a.resource_name ? `<div class="muted small">${esc(a.resource_name)}</div>` : ""}</td>
       <td><span class="badge ${cls}">${ALERT_KIND[a.kind] || a.kind}</span></td>
-      <td class="col-subject" title="${esc(a.subject)}">${esc(a.subject)}</td>
+      <td class="col-subject" title="${esc(a.subject)}">${esc(a.brief || a.subject)}</td>
       <td>${deliveryBadge(a.email_status)}</td><td>${deliveryBadge(a.feishu_status)}</td>
       <td class="nowrap col-actions"><button class="btn small" data-view="${i}">查看</button><button class="btn small danger" data-del="${a.id}">删除</button></td></tr>`;
   }).join("") || '<tr><td colspan="8" class="muted empty-row">暂无报警</td></tr>';

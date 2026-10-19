@@ -19,9 +19,10 @@ def fail(msg="HTTP 503"):
 
 
 class Harness:
-    def __init__(self, tmp_path, results=()):
+    def __init__(self, tmp_path, results=(), confirm_cycles=1):
         self.db = Database(tmp_path / "t.db")
-        self.db.set_settings({"retry_gap_seconds": "0", "baseline_min_samples": "3", "smtp_host": "x", "smtp_to": "a@b.c"})
+        self.db.set_settings({"retry_gap_seconds": "0", "baseline_min_samples": "3", "smtp_host": "x", "smtp_to": "a@b.c",
+                              "recovery_confirm_cycles": str(confirm_cycles), "alert_merge_seconds": "0"})
         self.queue = list(results)
         self.mails = []
         self.notices = []
@@ -45,11 +46,17 @@ class Harness:
     async def _feishu(self, settings, notice):
         self.notices.append(notice)
 
-    def cycle(self, *results):
+    def cycle(self, *results, model_id=None, flush=True):
         self.queue.extend(results)
-        asyncio.run(self.monitor.run_cycle(self.model_id, "schedule"))
+
+        async def go():
+            await self.monitor.run_cycle(model_id or self.model_id, "schedule")
+            if flush:
+                await self.monitor.flush_alerts()
+
+        asyncio.run(go())
         assert not self.queue, "unused probe results"
-        return self.db.get_model(self.model_id)
+        return self.db.get_model(model_id or self.model_id)
 
 
 def test_connectivity_retries_three_times_then_alerts(tmp_path):
@@ -164,13 +171,16 @@ def test_failed_feishu_alert_is_resent_before_recovery(tmp_path):
     raw = h.db.get_alert(a["id"])
     assert raw["feishu_retry_at"] > time.time() + 20 and raw["email_retry_at"] is None
 
-    # Network back: the recovery cycle first re-sends the missed "down" alert, then sends "recovered".
+    # Network back: the missed "down" and the "recovered" go out together, in order, as one merged message.
     network["up"] = True
     h.cycle(ok(500))
-    assert [n.kind for n in h.notices] == ["down", "recovered"]
-    assert h.notices[0].title.startswith("[补发]") and "原报警时间" in h.notices[0].summary
+    assert len(h.notices) == 1
+    merged = h.notices[0]
+    assert "2 条报警合并" in merged.title and "含补发" in merged.title
+    assert merged.details[0].endswith("（补发）") and "连通失败" in merged.details[0]
+    assert "已恢复" in merged.details[1]
     statuses = {x["kind"]: x["feishu_status"] for x in h.db.list_alerts()}
-    assert statuses == {"down": "已补发", "recovered": "已发送"}
+    assert statuses == {"down": "已补发（合并 2 条）", "recovered": "已发送（合并 2 条）"}
     # Email was delivered the first time and must not be sent twice.
     assert len(h.mails) == 2
 

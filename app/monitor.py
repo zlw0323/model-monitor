@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import sqlite3
 import time
@@ -15,6 +16,7 @@ from .crypto import decrypt
 from .db import Database
 from .feishu import FeishuNotConfigured, Notice
 from .feishu import send as send_feishu
+from .incidents import SLOW, Problem, describe
 from .mailer import MailNotConfigured, send_mail
 from .probes import TOKEN_PARAMS, ProbeResult, probe_image, probe_text
 from .scheduling import ProbeGate, next_slot, resource_key
@@ -26,11 +28,18 @@ MailFn = Callable[[dict[str, str], str, str], Awaitable[None]]
 FeishuFn = Callable[[dict[str, str], Notice], Awaitable[None]]
 
 KIND_LABEL = {"text": "文本/推理模型", "image": "图像模型"}
-TRIGGER_LABEL = {"schedule": "定时", "manual": "手动"}
+TRIGGER_LABEL = {"schedule": "定时", "manual": "手动", "fanout": "联动"}
+ALERT_KIND_LABEL = {"down": "连通失败", "slow": "TTFT 异常", "changed": "异常变化", "recovered": "恢复"}
 CHANNELS = ("email", "feishu")
 # Delay before each retry of a failed alert delivery; the last value repeats until we give up.
 RETRY_BACKOFF = (30, 60, 120, 300, 600)
 RETRY_GIVE_UP_SECONDS = 24 * 3600
+# Merged dispatch never holds an alert back longer than this, even while new ones keep arriving.
+MERGE_MAX_WAIT_SECONDS = 300
+MERGED_MAX_LINES = 50
+# After the first normal cycle of an incident, confirm the recovery this soon instead of a whole interval later.
+RECOVERY_RECHECK_SECONDS = 300
+FANOUT_COOLDOWN_SECONDS = 1800
 # Each probe may make two requests (token-parameter / image-format fallback), each with its own timeout.
 PROBE_HARD_LIMIT_SECONDS = {
     "text": 2 * config.TEXT_TIMEOUT_SECONDS + 30,
@@ -69,6 +78,8 @@ class Monitor:
         self._queued: set[int] = set()
         self._loop_task: asyncio.Task | None = None
         self._retry_task: asyncio.Task | None = None
+        self._flush_task: asyncio.Task | None = None
+        self._fanout_at: dict[int, float] = {}
         self._send_lock = asyncio.Lock()
         self._last_purge = 0.0
         self._limits_cache: tuple[float, dict[str, int]] = (0.0, {})
@@ -101,7 +112,7 @@ class Monitor:
                 self.db.update_model(m["id"], {"next_run_at": next_slot(m["id"], m["interval_minutes"], now)})
 
     async def stop(self) -> None:
-        tasks = [t for t in (self._loop_task, self._retry_task, *self._running.values()) if t]
+        tasks = [t for t in (self._loop_task, self._retry_task, self._flush_task, *self._running.values()) if t]
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -118,11 +129,14 @@ class Monitor:
         now = time.time()
         for m in self.db.due_models(now):
             self.trigger(m["id"], "schedule")
+        settings = self.db.get_settings()
+        if (self._flush_task is None or self._flush_task.done()) and self._flush_due(now, settings):
+            self._flush_task = asyncio.create_task(self.flush_alerts())
         if (self._retry_task is None or self._retry_task.done()) and self.db.due_alert_retries(now):
             self._retry_task = asyncio.create_task(self.retry_due_alerts())
         if now - self._last_purge > 3600:
             self._last_purge = now
-            days = int(self.db.get_settings().get("retention_days") or 90)
+            days = int(settings.get("retention_days") or 90)
             self.db.purge_older_than(now - days * 86400)
 
     def is_running(self, model_id: int) -> bool:
@@ -222,7 +236,7 @@ class Monitor:
             # A TTFT anomaly is re-measured with nothing else in flight, so a new alert rests on clean samples.
             # Not done when the model is already known to be slow (that would stall all checks every cycle),
             # nor for connectivity retests (a dead endpoint can take minutes to time out).
-            exclusive = bool(attempts) and attempts[-1][1] == "slow" and m["status"] != "slow"
+            exclusive = bool(attempts) and attempts[-1][1] == "slow" and m["incident_kind"] != "slow"
             self._queued.add(model_id)
             try:
                 async with self.gate.slot(m["kind"], host, exclusive) as slot:
@@ -259,105 +273,221 @@ class Monitor:
                 break
 
         final = attempts[-1][1]
-        prev = m["status"]
-        self.db.update_model(model_id, {"status": final, "last_check_at": time.time()})
         self.db.refresh_baseline_cache([model_id], int(settings["baseline_window"]), int(settings["baseline_min_samples"]))
-        await self._maybe_alert(m, prev, final, attempts, baseline, pct, trigger)
+        self._handle_outcome(m, final, attempts, baseline, pct, trigger, settings)
 
-    # ---- alerting ----
-    async def _maybe_alert(self, m, prev, final, attempts, baseline, pct, trigger) -> None:
-        if final == prev:
-            return
+    # ---- incidents ----
+    def _handle_outcome(self, m, final, attempts, baseline, pct, trigger, settings) -> None:
+        """Track the model's incident and queue at most one alert for this cycle.
+
+        One alert when a problem starts, one when its error content changes to something not yet reported
+        in this incident, and one when recovery is confirmed by `recovery_confirm_cycles` normal cycles.
+        Repeats of an already reported problem are only counted.
+        """
+        now = time.time()
+        upd: dict[str, Any] = {"status": final, "last_check_at": now}
+        event, problem = None, None
         if final in ("down", "slow"):
-            kind = final
-        elif final == "ok" and prev in ("down", "slow"):
-            kind = "recovered"
-        else:
+            try:
+                problem = SLOW if final == "slow" else describe(attempts[-1][0])
+            except Exception:
+                # Classification must never cost an alert.
+                log.exception("failed to classify probe error")
+                problem = Problem("other", "检测失败", "", "other")
+            seen = json.loads(m["incident_sigs"] or "[]")
+            if not m["incident_kind"]:
+                event, seen = "open", [problem.signature]
+                upd.update(incident_since=now, incident_cycles=1)
+            else:
+                upd["incident_cycles"] = (m["incident_cycles"] or 0) + 1
+                legacy = f"legacy:{final}"
+                if problem.signature not in seen and legacy in seen:
+                    # Alarmed before this version: adopt the first concrete error of that kind silently.
+                    seen = [s for s in seen if s != legacy] + [problem.signature]
+                elif problem.signature not in seen:
+                    event = "changed"
+                    seen.append(problem.signature)
+            upd.update(incident_kind=final, incident_sig=problem.signature, incident_sigs=json.dumps(seen[-20:]),
+                       incident_label=problem.label, incident_ok=0)
+        elif m["incident_kind"]:
+            ok_count = (m["incident_ok"] or 0) + 1
+            if ok_count >= max(1, int(settings.get("recovery_confirm_cycles") or 2)):
+                event = "recovered"
+                upd.update(incident_kind=None, incident_sig=None, incident_sigs=None, incident_label=None,
+                           incident_since=None, incident_ok=0, incident_cycles=0)
+            else:
+                # One good cycle could be a fluke while the model flaps: confirm soon instead of announcing it.
+                upd["incident_ok"] = ok_count
+                upd["next_run_at"] = min(m["next_run_at"] or now + RECOVERY_RECHECK_SECONDS, now + RECOVERY_RECHECK_SECONDS)
+        self.db.update_model(m["id"], upd)
+        if event:
+            self._queue_alert(m, event, final, problem, attempts, baseline, pct, trigger, settings, now)
+        if event == "open" and final == "down" and problem.resource_wide:
+            self._fan_out(m, settings, now)
+
+    def _fan_out(self, m, settings, now: float) -> None:
+        """A resource-wide error (bad key, network, Azure outage) likely hits every deployment of the resource:
+        check the others right away, so their alerts land in the same merged message instead of trickling in
+        over a whole interval."""
+        if str(settings.get("alert_fanout", "1")) != "1":
             return
-        notice = self._compose(m, kind, attempts, baseline, pct, trigger)
-        alert_id = self.db.insert_alert(m["id"], kind, notice.title, render_text(notice), notice.to_json())
-        # Earlier alerts for this model that failed to send go out first, so "down" never arrives after "recovered".
-        for pending in self.db.pending_alerts(m["id"], alert_id):
-            channels = [ch for ch in CHANNELS if pending[f"{ch}_retry_at"] is not None]
-            await self.deliver_alert(pending["id"], channels, resend=True)
-        await self.deliver_alert(alert_id, list(CHANNELS), resend=False)
+        rid = m["resource_id"]
+        if now - self._fanout_at.get(rid, 0) < FANOUT_COOLDOWN_SECONDS:
+            return
+        self._fanout_at[rid] = now
+        for other in self.db.models_of_resource(rid):
+            if other["id"] != m["id"] and other["enabled"] and (other["last_check_at"] or 0) < now - 120:
+                self.trigger(other["id"], "fanout")
+
+    def _queue_alert(self, m, event, final, problem, attempts, baseline, pct, trigger, settings, now) -> None:
+        notice, brief = self._compose(m, event, final, problem, attempts, baseline, pct, trigger, settings, now)
+        kind = "changed" if event == "changed" else ("recovered" if event == "recovered" else final)
+        self.db.insert_alert(m["id"], kind, notice.title, render_text(notice), notice.to_json(),
+                             model_name=m["name"], resource_name=m.get("resource_name"), brief=brief, queued=True)
+
+    # ---- dispatch ----
+    def _flush_due(self, now: float, settings: dict[str, str]) -> bool:
+        rows = self.db.queued_alerts()
+        if not rows:
+            return False
+        merge = int(settings.get("alert_merge_seconds") or 0)
+        newest, oldest = max(r["ts"] for r in rows), min(r["ts"] for r in rows)
+        return now - newest >= merge or now - oldest >= max(MERGE_MAX_WAIT_SECONDS, merge)
+
+    async def flush_alerts(self) -> None:
+        """Send every queued alert as one message per channel (with any still-undelivered older alerts first)."""
+        try:
+            async with self._send_lock:
+                rows = self.db.queued_alerts()
+                if not rows:
+                    return
+                ids = {r["id"] for r in rows}
+                self.db.execute(f"UPDATE alerts SET queued = 0 WHERE id IN ({', '.join('?' for _ in ids)})", tuple(ids))
+                sends = []
+                for ch in CHANNELS:
+                    earlier = [a for a in self.db.retry_pending(ch) if a["id"] not in ids]
+                    sends.append(self._send(ch, earlier + rows, {a["id"] for a in earlier}))
+                await asyncio.gather(*sends)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("alert flush failed")
 
     async def retry_due_alerts(self) -> None:
         try:
-            now = time.time()
-            for a in self.db.due_alert_retries(now):
-                channels = [ch for ch in CHANNELS if a[f"{ch}_retry_at"] is not None and a[f"{ch}_retry_at"] <= now]
-                await self.deliver_alert(a["id"], channels, resend=True)
+            async with self._send_lock:
+                now = time.time()
+                for ch in CHANNELS:
+                    pending = self.db.retry_pending(ch)
+                    if any(a[f"{ch}_retry_at"] <= now for a in pending):
+                        await self._send(ch, pending, {a["id"] for a in pending})
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("alert retry failed")
 
-    async def deliver_alert(self, alert_id: int, channels: list[str], resend: bool) -> None:
-        async with self._send_lock:
-            a = self.db.get_alert(alert_id)
-            if a and resend:
-                # Another task may have delivered it while we waited for the lock.
-                channels = [ch for ch in channels if a[f"{ch}_retry_at"] is not None]
-            if not a or not channels:
-                return
-            if not a.get("notice_json"):
-                # Rows created before retry support: nothing to resend.
-                self.db.update_alert(alert_id, {f"{ch}_retry_at": None for ch in channels})
-                return
-            notice = Notice.from_json(a["notice_json"])
-            if resend:
-                notice = replace(
-                    notice,
-                    title=f"[补发] {notice.title}",
-                    summary=f"{notice.summary}\n（原报警时间 {fmt_ts(a['ts'])}，当时发送失败，现补发）",
-                )
-            body = render_text(notice)
-            settings = self.db.get_settings()
-            senders = {
-                "email": lambda: self._mail(settings, notice.title, body),
-                "feishu": lambda: self._feishu(settings, notice),
-            }
-            not_configured = {"email": MailNotConfigured, "feishu": FeishuNotConfigured}
-            results = await asyncio.gather(*(_attempt(ch, senders[ch], not_configured[ch]) for ch in channels))
-
-            now = time.time()
-            fields: dict[str, Any] = {}
-            for ch, (outcome, err) in zip(channels, results):
-                tries = (a.get(f"{ch}_tries") or 0) + 1
-                fields[f"{ch}_tries"] = tries
-                if outcome == "sent":
-                    fields[f"{ch}_status"] = "已补发" if resend else "已发送"
-                    fields[f"{ch}_retry_at"] = None
-                elif outcome == "not_configured":
-                    fields[f"{ch}_status"] = f"未发送：{err}"
-                    fields[f"{ch}_retry_at"] = None
+    async def _send(self, channel: str, rows: list[dict], resend_ids: set[int]) -> None:
+        if not rows:
+            return
+        settings = self.db.get_settings()
+        notice = self._batch_notice(rows, resend_ids)
+        body = render_text(notice)
+        if channel == "email":
+            outcome, err = await _attempt(channel, lambda: self._mail(settings, notice.title, body), MailNotConfigured)
+        else:
+            outcome, err = await _attempt(channel, lambda: self._feishu(settings, notice), FeishuNotConfigured)
+        now = time.time()
+        merged = f"（合并 {len(rows)} 条）" if len(rows) > 1 else ""
+        for a in rows:
+            tries = (a.get(f"{channel}_tries") or 0) + 1
+            fields: dict[str, Any] = {f"{channel}_tries": tries}
+            if outcome == "sent":
+                fields[f"{channel}_status"] = ("已补发" if a["id"] in resend_ids else "已发送") + merged
+                fields[f"{channel}_retry_at"] = None
+            elif outcome == "not_configured":
+                fields[f"{channel}_status"] = f"未发送：{err}"
+                fields[f"{channel}_retry_at"] = None
+            else:
+                delay = RETRY_BACKOFF[min(tries - 1, len(RETRY_BACKOFF) - 1)]
+                if now + delay - a["ts"] > RETRY_GIVE_UP_SECONDS:
+                    fields[f"{channel}_status"] = f"发送失败（已重试 {tries} 次，放弃）：{err}"
+                    fields[f"{channel}_retry_at"] = None
                 else:
-                    delay = RETRY_BACKOFF[min(tries - 1, len(RETRY_BACKOFF) - 1)]
-                    if now + delay - a["ts"] > RETRY_GIVE_UP_SECONDS:
-                        fields[f"{ch}_status"] = f"发送失败（已重试 {tries} 次，放弃）：{err}"
-                        fields[f"{ch}_retry_at"] = None
-                    else:
-                        fields[f"{ch}_status"] = f"发送失败，将自动重试（已尝试 {tries} 次）：{err}"
-                        fields[f"{ch}_retry_at"] = now + delay
-            self.db.update_alert(alert_id, fields)
-            for ch, (outcome, _) in zip(channels, results):
-                if outcome == "sent":
-                    self.db.expedite_retries(ch, now)
+                    fields[f"{channel}_status"] = f"发送失败，将自动重试（已尝试 {tries} 次）：{err}"
+                    fields[f"{channel}_retry_at"] = now + delay
+            self.db.update_alert(a["id"], fields)
 
     @staticmethod
-    def _compose(m, kind, attempts, baseline, pct, trigger) -> Notice:
+    def _batch_notice(rows: list[dict], resend_ids: set[int]) -> Notice:
+        rows = sorted(rows, key=lambda a: (a["ts"], a["id"]))
+        if len(rows) == 1:
+            a = rows[0]
+            n = Notice.from_json(a["notice_json"]) if a.get("notice_json") else Notice("down", a["subject"], a["message"])
+            if a["id"] in resend_ids:
+                n = replace(n, title=f"[补发] {n.title}",
+                            summary=f"{n.summary}\n（原报警时间 {fmt_ts(a['ts'])}，当时发送失败，现补发）")
+            return n
+        kinds = [Notice.from_json(a["notice_json"]).kind if a.get("notice_json") else a["kind"] for a in rows]
+        color = "down" if "down" in kinds else "slow" if "slow" in kinds else "recovered"
+        counts = {k: sum(1 for a in rows if a["kind"] == k) for k in ALERT_KIND_LABEL}
+        parts = "，".join(f"{ALERT_KIND_LABEL[k]} {n}" for k, n in counts.items() if n)
+        title = f"[模型监控] {len(rows)} 条报警合并：{parts}" + ("（含补发）" if resend_ids else "")
+        by_res: dict[str, list[dict]] = {}
+        for a in rows:
+            by_res.setdefault(a.get("resource_name") or "-", []).append(a)
+        summary_lines = []
+        for res, items in by_res.items():
+            c = "，".join(f"{ALERT_KIND_LABEL[k]} {n} 个" for k in ALERT_KIND_LABEL
+                         if (n := sum(1 for a in items if a["kind"] == k)))
+            reasons = {(a.get("brief") or "").split(" · ", 1)[-1] for a in items if a["kind"] == "down"}
+            if len(reasons) == 1 and sum(1 for a in items if a["kind"] == "down") > 1:
+                c += f"（均为 {reasons.pop()}）"
+            summary_lines.append(f"资源 {res}：{c}")
+        details = []
+        for a in rows[:MERGED_MAX_LINES]:
+            line = f"[{fmt_ts(a['ts'])[11:]}] {a.get('model_name') or '-'}：{a.get('brief') or a['subject']}"
+            details.append(line[:120] + ("（补发）" if a["id"] in resend_ids else ""))
+        if len(rows) > MERGED_MAX_LINES:
+            details.append(f"…另有 {len(rows) - MERGED_MAX_LINES} 条，见平台“报警记录”")
+        facts = [("报警条数", str(len(rows))), ("时间范围", f"{fmt_ts(rows[0]['ts'])} ~ {fmt_ts(rows[-1]['ts'])[11:]}")]
+        footer = f"同一时间段内的报警已合并为一条消息，单条明细见平台“报警记录”。时区：{config.APP_TZ.key}"
+        return Notice(color, title, "\n".join(summary_lines), facts, details, footer)
+
+    @staticmethod
+    def _compose(m, event, final, problem, attempts, baseline, pct, trigger, settings, now) -> tuple[Notice, str]:
         name = m["name"]
         retries = len(attempts) - 1
-        if kind == "down":
-            title = f"[模型监控][报警] {name} 连通性失败"
-            summary = f"连通性失败：首次检测及 {retries} 次重测均失败。"
-        elif kind == "slow":
-            title = f"[模型监控][报警] {name} TTFT 异常"
-            summary = f"TTFT 异常：首次检测及 {retries} 次重测均超出预警值。"
-        else:
+        last = attempts[-1][0]
+        th = baseline * (1 + pct / 100) if baseline else None
+        state_label = "连通性失败" if final == "down" else "TTFT 异常"
+        if event == "recovered":
+            need = max(1, int(settings.get("recovery_confirm_cycles") or 2))
+            duration = fmt_duration(now - (m["incident_since"] or now))
             title = f"[模型监控][恢复] {name} 已恢复正常"
-            summary = "模型已恢复正常。"
+            summary = (f"已恢复正常（连续 {need} 轮检测正常）。异常持续 {duration}，期间 {m['incident_cycles'] or 1} 轮检测异常"
+                       f"（{m['incident_label'] or '-'}）。")
+            brief, kind = f"已恢复 · 异常持续 {duration}", "recovered"
+        else:
+            reason = problem.label
+            if event == "changed":
+                title = f"[模型监控][异常变化] {name} {state_label}（{reason}）"
+                summary = (f"异常内容发生变化（本次异常开始于 {fmt_ts(m['incident_since'] or now)}，"
+                           f"之前为：{m['incident_label'] or '-'}）。现为 {state_label}：{reason}。")
+            elif final == "down":
+                title = f"[模型监控][报警] {name} {state_label}（{reason}）"
+                summary = f"{state_label}：{reason}。首次检测及 {retries} 次重测均失败。"
+            else:
+                title = f"[模型监控][报警] {name} {state_label}"
+                summary = f"{state_label}：首次检测及 {retries} 次重测均超出预警值。"
+            if problem.detail:
+                summary += f"\n错误信息：{problem.detail}"
+            summary += "\n同一异常不会重复报警，恢复时会再通知。"
+            if final == "down":
+                brief = ("异常变化 → " if event == "changed" else "") + f"连通失败 · {reason}"
+            else:
+                ttft = f"{last.ttft_ms:.0f} ms" if last.ttft_ms is not None else "-"
+                brief = ("异常变化 → " if event == "changed" else "") + f"TTFT 异常 · 最新 {ttft}" + (f"（预警 > {th:.0f} ms）" if th else "")
+            kind = final
         host = urlsplit(m["endpoint"] if "://" in m["endpoint"] else "https://" + m["endpoint"]).hostname
         facts = [
             ("模型名称", name),
@@ -368,7 +498,7 @@ class Monitor:
             ("端点主机", host or "-"),
         ]
         if baseline:
-            facts.append(("TTFT 基线", f"{baseline:.0f} ms，预警 +{pct:g}%（> {baseline * (1 + pct / 100):.0f} ms）"))
+            facts.append(("TTFT 基线", f"{baseline:.0f} ms，预警 +{pct:g}%（> {th:.0f} ms）"))
         else:
             facts.append(("TTFT 基线", "样本不足，尚未启用 TTFT 预警"))
         details = []
@@ -381,7 +511,18 @@ class Monitor:
             if r.error:
                 line += f"，错误：{r.error}"
             details.append(line)
-        return Notice(kind, title, summary, facts, details, f"时区：{config.APP_TZ.key}")
+        return Notice(kind, title, summary, facts, details, f"时区：{config.APP_TZ.key}"), brief
+
+
+def fmt_duration(seconds: float) -> str:
+    s = int(max(0, seconds))
+    if s < 60:
+        return f"{s} 秒"
+    if s < 3600:
+        return f"{s // 60} 分钟"
+    if s < 86400:
+        return f"{s // 3600} 小时 {s % 3600 // 60} 分钟"
+    return f"{s // 86400} 天 {s % 86400 // 3600} 小时"
 
 
 def render_text(n: Notice) -> str:

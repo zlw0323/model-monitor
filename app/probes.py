@@ -85,7 +85,8 @@ def _has_token(chunk: dict) -> bool:
 
 
 def _short(text: str, limit: int = 500) -> str:
-    text = " ".join(text.split())
+    # Lone surrogates (an emoji cut in half by the upstream) can't be stored in SQLite: replace them.
+    text = " ".join(text.encode("utf-8", "replace").decode("utf-8").split())
     return text if len(text) <= limit else text[:limit] + "…"
 
 

@@ -96,9 +96,20 @@ def build_card(n: Notice) -> dict:
 
 def build_payload(n: Notice, secret: str, now: int | None = None) -> dict:
     payload: dict = {"msg_type": "interactive", "card": build_card(n)}
-    if len(json.dumps(payload, ensure_ascii=False).encode()) > MAX_BODY_BYTES and n.details:
-        short = [d if len(d) <= 300 else d[:300] + "…" for d in n.details]
-        payload["card"] = build_card(Notice(n.kind, n.title, n.summary, n.facts, short, n.footer))
+
+    def size() -> int:
+        return len(json.dumps(payload, ensure_ascii=False).encode())
+
+    if size() > MAX_BODY_BYTES and n.details:
+        details = [d if len(d) <= 300 else d[:300] + "…" for d in n.details]
+        keep = len(details)
+        while True:
+            hidden = len(details) - keep
+            shown = details[:keep] + ([f"…另有 {hidden} 行未显示，见平台“报警记录”"] if hidden else [])
+            payload["card"] = build_card(Notice(n.kind, n.title, n.summary, n.facts, shown, n.footer))
+            if size() <= MAX_BODY_BYTES or keep == 0:
+                break
+            keep -= 1
     if secret:
         ts = int(now if now is not None else time.time())
         payload = {"timestamp": str(ts), "sign": gen_sign(ts, secret), **payload}

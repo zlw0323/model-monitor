@@ -42,6 +42,21 @@ code { background: #f3f4f6; padding: 1px 4px; border-radius: 4px; font-size: 12p
 .alerts-table .col-actions .btn + .btn { margin-left: 6px; }
 .empty-row { text-align: center !important; padding: 24px !important; }
 
+/* detail dialog */
+.dialog-head { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+.dialog-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.dialog-title h2 { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.icon-btn { flex-shrink: 0; width: 32px; height: 32px; border: none; border-radius: 6px; background: transparent; color: var(--muted); font-size: 16px; line-height: 1; cursor: pointer; }
+.icon-btn:hover { background: #f3f4f6; color: var(--text); }
+#detail-meta { margin: 8px 0 0; }
+.detail-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin: 14px 0 4px; padding-top: 12px; border-top: 1px solid var(--border); }
+.segmented { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.segmented button { border: none; background: #fff; color: var(--text); padding: 5px 14px; font-size: 13px; cursor: pointer; }
+.segmented button + button { border-left: 1px solid var(--border); }
+.segmented button:hover { background: #f9fafb; }
+.segmented button.active { background: var(--primary); color: #fff; }
+.detail-actions { display: flex; gap: 8px; }
+
 /* list view */
 .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
 .chip { border: 1px solid var(--border); background: #fff; border-radius: 16px; padding: 4px 12px; font-size: 13px; cursor: pointer; color: var(--text); }

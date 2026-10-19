@@ -9,6 +9,9 @@ Behaviour is selected by the `model` (deployment) name:
   down        always HTTP 503
   flaky       fails every other request
   image       images endpoint, ~1 s
+  throttled   always HTTP 429 "high demand" (retry seconds vary)
+
+API key "bad-key" gets HTTP 401 on every deployment (simulates a whole resource with a wrong key).
 
 Also a fake Feishu bot at /open-apis/bot/v2/hook/<any> (signature secret "test-secret");
 received messages are listed at GET /feishu-messages.
@@ -33,8 +36,12 @@ def _chunk(delta: dict, finish=None) -> str:
 async def chat(req: Request):
     if not req.headers.get("authorization", "").startswith("Bearer "):
         return JSONResponse({"error": {"message": "missing key"}}, 401)
+    if req.headers.get("authorization") == "Bearer bad-key":
+        return JSONResponse({"error": {"code": "401", "message": "Access denied due to invalid subscription key or wrong API endpoint."}}, 401)
     body = await req.json()
     model = body.get("model")
+    if model == "throttled":
+        return JSONResponse({"error": {"code": "429", "message": f"The system is currently experiencing high demand. Retry after {next(_counter) % 50 + 1} seconds."}}, 429)
     if model == "down":
         return JSONResponse({"error": {"message": "Service unavailable"}}, 503)
     if model == "flaky" and next(_counter) % 2 == 0:

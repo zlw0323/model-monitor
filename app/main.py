@@ -50,6 +50,9 @@ INT_SETTINGS = {
     "max_concurrent_text": (1, 50),
     "max_concurrent_image": (1, 50),
     "max_concurrent_per_host": (1, 50),
+    "alert_merge_seconds": (0, 600),
+    "recovery_confirm_cycles": (1, 10),
+    "alert_fanout": (0, 1),
 }
 FLOAT_SETTINGS = {"ttft_threshold_pct": (1, 10000)}
 TEXT_SETTINGS = ("smtp_host", "smtp_username", "smtp_from", "smtp_to")
@@ -265,6 +268,14 @@ def create_app(
             "baseline_min_samples": int(settings["baseline_min_samples"]),
             "token_param": m["token_param"],
             "status": m["status"],
+            "incident": {
+                "kind": m["incident_kind"],
+                "label": m["incident_label"],
+                "since": m["incident_since"],
+                "cycles": m["incident_cycles"],
+                "ok": m["incident_ok"],
+                "confirm_needed": int(settings.get("recovery_confirm_cycles") or 2),
+            } if m["incident_kind"] else None,
             "running": monitor.is_running(m["id"]),
             "queued": monitor.is_queued(m["id"]),
             "last_check_at": m["last_check_at"],
@@ -323,6 +334,13 @@ def create_app(
     def soon(model_id: int, window_seconds: float) -> float:
         # Spread first checks of many models over a short window instead of firing them all at once.
         return time.time() + 5 + ((model_id * 0.6180339887498949) % 1.0) * window_seconds
+
+    # A new target is a different thing to watch: forget the learned baseline, token-param detection and incident.
+    RESET_TARGET = {
+        "baseline_auto_ms": None, "baseline_samples": 0, "token_param": "max_completion_tokens", "status": "unknown",
+        "incident_kind": None, "incident_sig": None, "incident_sigs": None, "incident_label": None,
+        "incident_since": None, "incident_ok": 0, "incident_cycles": 0,
+    }
 
     @app.get("/api/dashboard")
     def dashboard(
@@ -394,9 +412,7 @@ def create_app(
         }
         target_changed = any(old[k] != fields[k] for k in ("kind", "resource_id", "deployment", "endpoint_override"))
         if target_changed:
-            # A different target makes the learned baseline and token-param detection meaningless.
-            fields.update(baseline_reset_at=time.time(), baseline_auto_ms=None, baseline_samples=0,
-                          token_param="max_completion_tokens", status="unknown")
+            fields.update(RESET_TARGET, baseline_reset_at=time.time())
         if target_changed or (body.enabled and not old["enabled"]):
             fields["next_run_at"] = time.time()
         elif body.interval_minutes != old["interval_minutes"]:
@@ -523,8 +539,7 @@ def create_app(
         for m in models:
             upd: dict[str, Any] = {}
             if endpoint_changed:
-                upd.update(baseline_reset_at=time.time(), baseline_auto_ms=None, baseline_samples=0,
-                           token_param="max_completion_tokens", status="unknown")
+                upd.update(RESET_TARGET, baseline_reset_at=time.time())
             if (endpoint_changed or body.api_key) and m["enabled"]:
                 upd["next_run_at"] = soon(m["id"], 120)  # verify the new endpoint/key soon, without a burst
             db.update_model(m["id"], upd)
