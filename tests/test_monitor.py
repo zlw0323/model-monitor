@@ -215,6 +215,45 @@ def test_not_configured_is_not_retried(tmp_path):
     assert a["feishu_status"].startswith("未发送") and a["feishu_retry_at"] is None
 
 
+def test_hung_probe_is_force_stopped_and_frees_its_slot(tmp_path, monkeypatch):
+    import app.monitor as monitor_mod
+
+    monkeypatch.setitem(monitor_mod.PROBE_HARD_LIMIT_SECONDS, "text", 0.2)
+    h = Harness(tmp_path)
+
+    async def hang(m, key):
+        await asyncio.sleep(3600)
+
+    h.monitor._probe_override = hang
+    h.db.set_settings({"retry_count": "0"})
+    t0 = time.monotonic()
+    m = h.cycle()
+    assert time.monotonic() - t0 < 5
+    row = h.db.list_checks(h.model_id, 0)[0]
+    assert m["status"] == "down" and "强制结束" in row["error"]
+    assert h.monitor.gate.inflight == 0
+
+
+def test_each_probe_uses_its_own_http_client(tmp_path, monkeypatch):
+    import app.monitor as monitor_mod
+
+    seen = []
+
+    async def fake_probe_text(client, endpoint, deployment, key, token_param):
+        seen.append(client)
+        assert not client.is_closed
+        return ok(100)
+
+    monkeypatch.setattr(monitor_mod, "probe_text", fake_probe_text)
+    h = Harness(tmp_path)
+    h.monitor._probe_override = None
+    model = h.db.get_model(h.model_id)
+    asyncio.run(h.monitor._probe(model, "k"))
+    asyncio.run(h.monitor._probe(model, "k"))
+    assert len(seen) == 2 and seen[0] is not seen[1]
+    assert all(c.is_closed for c in seen)  # nothing outlives a probe, so a wedged pool can't persist
+
+
 def test_scheduler_trigger_sets_next_run(tmp_path):
     h = Harness(tmp_path)
 

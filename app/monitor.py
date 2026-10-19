@@ -31,6 +31,11 @@ CHANNELS = ("email", "feishu")
 # Delay before each retry of a failed alert delivery; the last value repeats until we give up.
 RETRY_BACKOFF = (30, 60, 120, 300, 600)
 RETRY_GIVE_UP_SECONDS = 24 * 3600
+# Each probe may make two requests (token-parameter / image-format fallback), each with its own timeout.
+PROBE_HARD_LIMIT_SECONDS = {
+    "text": 2 * config.TEXT_TIMEOUT_SECONDS + 30,
+    "image": 2 * config.IMAGE_TIMEOUT_SECONDS + 30,
+}
 
 
 def fmt_ts(ts: float) -> str:
@@ -60,7 +65,6 @@ class Monitor:
         self._mail = mail_fn or send_mail
         self._feishu = feishu_fn or send_feishu
         self._tick_seconds = tick_seconds
-        self._client: httpx.AsyncClient | None = None
         self._running: dict[int, asyncio.Task] = {}
         self._queued: set[int] = set()
         self._loop_task: asyncio.Task | None = None
@@ -84,7 +88,6 @@ class Monitor:
 
     # ---- lifecycle ----
     async def start(self) -> None:
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=15.0), follow_redirects=False)
         self.realign_schedule()
         self._loop_task = asyncio.create_task(self._loop())
 
@@ -100,8 +103,6 @@ class Monitor:
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        if self._client:
-            await self._client.aclose()
 
     async def _loop(self) -> None:
         while True:
@@ -153,22 +154,36 @@ class Monitor:
         v = m.get("ttft_threshold_pct")
         return float(v) if v is not None else float(settings["ttft_threshold_pct"])
 
+    async def _guarded_probe(self, m: dict[str, Any], key: str) -> ProbeResult:
+        # Safety net on top of the per-request timeouts: whatever hangs (connection close, a library bug),
+        # a probe never holds its concurrency slot longer than this.
+        limit = PROBE_HARD_LIMIT_SECONDS[m["kind"]]
+        t0 = time.perf_counter()
+        try:
+            async with asyncio.timeout(limit):
+                return await self._probe(m, key)
+        except TimeoutError:
+            return ProbeResult(False, None, None, round((time.perf_counter() - t0) * 1000, 1), f"检测超时（>{limit}s，已强制结束）")
+
     async def _probe(self, m: dict[str, Any], key: str) -> ProbeResult:
         if self._probe_override:
             return await self._probe_override(m, key)
-        assert self._client is not None
-        if m["kind"] == "image":
-            return await probe_image(self._client, m["endpoint"], m["deployment"], key)
-        r = await probe_text(self._client, m["endpoint"], m["deployment"], key, m["token_param"])
-        if r.rejected_param:
-            # Older/third-party models only accept max_tokens, newer reasoning models only max_completion_tokens.
-            alt = next(p for p in TOKEN_PARAMS if p != r.rejected_param)
-            r2 = await probe_text(self._client, m["endpoint"], m["deployment"], key, alt)
-            if not r2.rejected_param:
-                m["token_param"] = alt
-                self.db.update_model(m["id"], {"token_param": alt})
-            return r2
-        return r
+        # A fresh client per probe: a pool shared across probes can get wedged after a network outage
+        # (requests left waiting for a connection that never comes) and then time out forever.
+        # Pooled connections idle out after 5s anyway, so checks minutes apart never reused them.
+        async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=15.0), follow_redirects=False) as client:
+            if m["kind"] == "image":
+                return await probe_image(client, m["endpoint"], m["deployment"], key)
+            r = await probe_text(client, m["endpoint"], m["deployment"], key, m["token_param"])
+            if r.rejected_param:
+                # Older/third-party models only accept max_tokens, newer reasoning models only max_completion_tokens.
+                alt = next(p for p in TOKEN_PARAMS if p != r.rejected_param)
+                r2 = await probe_text(client, m["endpoint"], m["deployment"], key, alt)
+                if not r2.rejected_param:
+                    m["token_param"] = alt
+                    self.db.update_model(m["id"], {"token_param": alt})
+                return r2
+            return r
 
     async def run_cycle(self, model_id: int, trigger: str) -> None:
         try:
@@ -211,7 +226,10 @@ class Monitor:
                 async with self.gate.slot(m["kind"], host, exclusive) as slot:
                     self._queued.discard(model_id)
                     ts = time.time()
-                    r = ProbeResult(False, error=key_error) if key_error else await self._probe(m, key)
+                    if key_error:
+                        r = ProbeResult(False, error=key_error)
+                    else:
+                        r = await self._guarded_probe(m, key)
             finally:
                 self._queued.discard(model_id)
             verdict = classify(r, baseline, pct)
