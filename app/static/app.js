@@ -12,7 +12,7 @@ const STATUS = {
 const ALERT_KIND = { down: "连通失败", slow: "TTFT 异常", recovered: "恢复" };
 const KIND = { text: "文本/推理", image: "图像" };
 
-const state = { models: [], charts: new Map(), editingId: null, detailId: null, timer: null };
+const state = { models: [], resources: [], editingId: null, editingResourceId: null, detailId: null, timer: null };
 
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
@@ -94,13 +94,16 @@ $("#logout-btn").addEventListener("click", async () => {
 // ---------- routing ----------
 function route() {
   const tab = (location.hash || "#dashboard").slice(1);
-  const valid = ["dashboard", "alerts", "settings"].includes(tab) ? tab : "dashboard";
+  const valid = ["dashboard", "resources", "alerts", "settings"].includes(tab) ? tab : "dashboard";
   $$(".tab").forEach((el) => el.classList.toggle("hidden", el.id !== `tab-${valid}`));
   $$("nav a").forEach((a) => a.classList.toggle("active", a.dataset.tab === valid));
   stopTimer();
   if (valid === "dashboard") {
+    renderResourceFilter();
     loadDashboard();
     state.timer = setInterval(loadDashboard, 15000);
+  } else if (valid === "resources") {
+    loadResources();
   } else if (valid === "alerts") {
     loadAlerts();
     state.timer = setInterval(loadAlerts, 15000);
@@ -116,96 +119,271 @@ window.addEventListener("hashchange", () => {
   if (!$("#app-view").classList.contains("hidden")) route();
 });
 
-// ---------- dashboard ----------
+// ---------- dashboard (list view) ----------
+const SEVERITY = { down: 0, slow: 1, unknown: 2, ok: 3, disabled: 4 };
+const FILTER_KEY = "mm.filters.v1";
+Object.assign(state, {
+  resList: [],
+  selected: new Set(),
+  sort: { key: "status", dir: 1 },
+  filter: { status: "", search: "", kind: "", resource: "", abnormal: false },
+});
+try {
+  Object.assign(state.filter, JSON.parse(localStorage.getItem(FILTER_KEY) || "{}"));
+} catch { /* ignore broken saved filters */ }
+
+function saveFilters() {
+  localStorage.setItem(FILTER_KEY, JSON.stringify(state.filter));
+}
+function effStatus(m) {
+  return m.enabled ? m.status : "disabled";
+}
+
 async function loadDashboard() {
-  let models;
+  let data;
   try {
-    models = await api("/api/models");
+    data = await api("/api/dashboard");
   } catch {
     return;
   }
-  state.models = models;
-  renderSummary(models);
-  renderGrid(models);
-  const hours = Number($("#range-select").value);
-  await Promise.all(models.map((m) => loadCardChart(m, hours)));
+  state.models = data.models;
+  state.resList = data.resources;
+  const ids = new Set(state.models.map((m) => m.id));
+  for (const id of [...state.selected]) if (!ids.has(id)) state.selected.delete(id);
+  renderResourceFilter();
+  renderSummary();
+  renderTable();
   if (state.detailId && $("#detail-dialog").open) refreshDetail();
 }
 
-function renderSummary(models) {
-  const count = (s) => models.filter((m) => m.enabled && m.status === s).length;
-  $("#summary").innerHTML = `
-    <span>共 <b>${models.length}</b> 个模型</span>
-    <span class="dot ok"></span>正常 <b>${count("ok")}</b>
-    <span class="dot warn"></span>TTFT 异常 <b>${count("slow")}</b>
-    <span class="dot bad"></span>连通失败 <b>${count("down")}</b>
-    <span class="dot muted"></span>未检测 <b>${count("unknown")}</b>`;
+function renderResourceFilter() {
+  const sel = $("#f-resource");
+  const opts = ['<option value="">全部资源</option>'].concat(
+    state.resList.map((r) => `<option value="${r.id}">${esc(r.name)}（${r.model_count}）</option>`),
+  );
+  sel.innerHTML = opts.join("");
+  if (state.filter.resource && !state.resList.some((r) => String(r.id) === String(state.filter.resource))) state.filter.resource = "";
+  sel.value = state.filter.resource;
+}
+
+function renderSummary() {
+  const counts = { "": state.models.length, ok: 0, slow: 0, down: 0, unknown: 0, disabled: 0 };
+  for (const m of state.models) counts[effStatus(m)]++;
+  const chip = (key, label, cls) =>
+    `<button class="chip ${cls} ${state.filter.status === key ? "active" : ""}" data-status="${key}">${label} <b>${counts[key]}</b></button>`;
+  $("#summary").innerHTML = [
+    chip("", "全部", ""), chip("ok", "正常", "ok"), chip("slow", "TTFT 异常", "warn"),
+    chip("down", "连通失败", "bad"), chip("unknown", "未检测", "muted"), chip("disabled", "已停用", "muted"),
+  ].join("");
+}
+
+function filteredModels() {
+  const f = state.filter;
+  const q = f.search.trim().toLowerCase();
+  return state.models.filter((m) => {
+    const st = effStatus(m);
+    if (f.status && st !== f.status) return false;
+    if (f.abnormal && st !== "down" && st !== "slow") return false;
+    if (f.kind && m.kind !== f.kind) return false;
+    if (f.resource && String(m.resource_id) !== String(f.resource)) return false;
+    if (q && !`${m.name} ${m.deployment} ${m.resource_name}`.toLowerCase().includes(q)) return false;
+    return true;
+  });
+}
+
+function sortModels(list) {
+  const { key, dir } = state.sort;
+  const nullsLast = (a, b) => (a == null) - (b == null);
+  const cmp = {
+    status: (a, b) => SEVERITY[effStatus(a)] - SEVERITY[effStatus(b)],
+    name: (a, b) => a.name.localeCompare(b.name, "zh"),
+    resource: (a, b) => a.resource_name.localeCompare(b.resource_name, "zh"),
+    ttft: (a, b) => nullsLast(a.latest?.ttft_ms, b.latest?.ttft_ms) || (a.latest?.ttft_ms ?? 0) - (b.latest?.ttft_ms ?? 0),
+    avail: (a, b) => nullsLast(a.availability_24h, b.availability_24h) || (a.availability_24h ?? 0) - (b.availability_24h ?? 0),
+    last: (a, b) => (b.last_check_at ?? 0) - (a.last_check_at ?? 0),
+  }[key];
+  return [...list].sort((a, b) => dir * cmp(a, b) || a.name.localeCompare(b.name, "zh"));
 }
 
 function baselineText(m) {
   if (m.baseline_source === "manual") return `${fmtMs(m.baseline_ms)}（手动）`;
-  if (m.baseline_source === "auto") return `${fmtMs(m.baseline_ms)}（自动）`;
-  return `学习中 ${m.baseline_samples}/${m.baseline_min_samples}`;
+  if (m.baseline_source === "auto") return fmtMs(m.baseline_ms);
+  return `<span class="muted">学习中 ${m.baseline_samples}/${m.baseline_min_samples}</span>`;
 }
 
-function renderGrid(models) {
-  $("#empty-hint").classList.toggle("hidden", models.length > 0);
-  const grid = $("#model-grid");
-  const ids = new Set(models.map((m) => m.id));
-  for (const [id, chart] of state.charts) {
-    if (!ids.has(id)) {
-      chart.destroy();
-      state.charts.delete(id);
-    }
+function sparkSvg(m) {
+  const pts = m.spark || [];
+  const W = 120, H = 28, P = 2;
+  if (!pts.length) return '<span class="muted small">-</span>';
+  const t0 = pts[0][0], t1 = Math.max(pts[pts.length - 1][0], t0 + 1);
+  const threshold = m.baseline_ms ? m.baseline_ms * (1 + m.effective_threshold_pct / 100) : null;
+  const yMax = Math.max(1, ...pts.map((p) => p[1] || 0), threshold || 0);
+  const x = (t) => (P + ((t - t0) / (t1 - t0)) * (W - 2 * P)).toFixed(1);
+  const y = (v) => (H - P - (v / yMax) * (H - 2 * P)).toFixed(1);
+  const okPts = pts.filter((p) => p[2] !== 2);
+  let svg = `<svg class="spark" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" aria-hidden="true">`;
+  if (threshold) svg += `<line x1="${P}" x2="${W - P}" y1="${y(threshold)}" y2="${y(threshold)}" class="spark-th"/>`;
+  if (okPts.length > 1) svg += `<polyline class="spark-line" points="${okPts.map((p) => `${x(p[0])},${y(p[1])}`).join(" ")}"/>`;
+  for (const p of pts) {
+    if (p[2] === 2) svg += `<rect class="spark-fail" x="${(x(p[0]) - 1.5).toFixed(1)}" y="${H - 6}" width="3" height="4"/>`;
+    else if (p[2] === 1) svg += `<circle class="spark-anom" cx="${x(p[0])}" cy="${y(p[1])}" r="2"/>`;
   }
-  $$(".model-card", grid).forEach((el) => {
-    if (!ids.has(Number(el.dataset.id))) el.remove();
+  if (okPts.length === 1) svg += `<circle class="spark-dot" cx="${x(okPts[0][0])}" cy="${y(okPts[0][1])}" r="1.8"/>`;
+  return svg + "</svg>";
+}
+
+function statusCell(m) {
+  const st = effStatus(m);
+  const badge = st === "disabled" ? '<span class="badge muted">已停用</span>'
+    : `<span class="badge ${(STATUS[st] || STATUS.unknown).cls}">${(STATUS[st] || STATUS.unknown).label}</span>`;
+  const activity = m.queued ? '<span class="badge muted" title="等待其他检测完成（并发上限或独占重测）">排队中</span>'
+    : m.running ? '<span class="badge info">检测中</span>' : "";
+  return `${badge}${activity}`;
+}
+
+function ttftCell(m) {
+  const l = m.latest;
+  if (!l) return "-";
+  if (!l.success) return `<span class="badge bad" title="${esc(l.error || "")}">失败</span>`;
+  return `<span class="${l.anomaly ? "warn-text" : ""}" title="${l.interfered ? "与图像检测同时进行（受干扰）" : ""}">${fmtMs(l.ttft_ms)}${l.interfered ? "*" : ""}</span>`;
+}
+
+function renderTable() {
+  const list = sortModels(filteredModels());
+  const empty = $("#empty-hint");
+  if (!state.models.length) {
+    empty.textContent = "还没有模型。先在“资源”页添加 Azure 资源，再点击“添加模型”或“批量导入”。";
+  } else if (!list.length) {
+    empty.textContent = "没有符合筛选条件的模型。";
+  }
+  empty.classList.toggle("hidden", list.length > 0);
+  $$(".models-table th[data-sort]").forEach((th) => {
+    th.classList.toggle("sorted", th.dataset.sort === state.sort.key);
+    th.dataset.dir = th.dataset.sort === state.sort.key ? (state.sort.dir > 0 ? "asc" : "desc") : "";
   });
-  for (const m of models) {
-    let card = $(`.model-card[data-id="${m.id}"]`, grid);
-    if (!card) {
-      card = document.createElement("div");
-      card.className = "card model-card";
-      card.dataset.id = m.id;
-      card.innerHTML = `<div class="card-body"></div><div class="chart-wrap"><canvas></canvas></div>
-        <div class="card-actions">
-          <button class="btn small" data-act="run">立即检测</button>
-          <button class="btn small" data-act="detail">详情</button>
-          <button class="btn small" data-act="edit">编辑</button>
-          <button class="btn small danger" data-act="delete">删除</button>
-        </div>`;
-      card.addEventListener("click", (e) => onCardAction(e, m.id));
-      grid.appendChild(card);
-    }
-    const st = STATUS[m.status] || STATUS.unknown;
-    const latest = m.latest;
-    const thresholdMs = m.baseline_ms ? m.baseline_ms * (1 + m.effective_threshold_pct / 100) : null;
-    const errorLine = latest && !latest.success && latest.error ? `<div class="err" title="${esc(latest.error)}">${esc(latest.error)}</div>` : "";
-    $(".card-body", card).innerHTML = `
-      <div class="card-head">
-        <div>
-          <div class="model-name">${esc(m.name)}</div>
-          <div class="muted small">${KIND[m.kind]} · ${esc(m.deployment)}</div>
-        </div>
-        <div class="badges">
-          ${m.queued ? '<span class="badge muted" title="等待其他检测完成（并发上限或独占重测）">排队中…</span>' : m.running ? '<span class="badge info">检测中…</span>' : ""}
-          ${m.enabled ? `<span class="badge ${st.cls}">${st.label}</span>` : '<span class="badge muted">已停用</span>'}
-        </div>
-      </div>
-      <div class="metrics">
-        <div><label>最新 TTFT</label><b class="${latest && latest.anomaly ? "warn-text" : ""}">${latest ? fmtMs(latest.ttft_ms) : "-"}</b></div>
-        <div><label>基线</label><b>${baselineText(m)}</b></div>
-        <div><label>预警值</label><b>${thresholdMs ? `> ${fmtMs(thresholdMs)}` : "-"}</b><span class="muted small"> +${m.effective_threshold_pct}%</span></div>
-        <div><label>24h 可用率</label><b>${fmtPct(m.availability_24h)}</b></div>
-        <div><label>7d 可用率</label><b>${fmtPct(m.availability_7d)}</b></div>
-        <div><label>间隔</label><b>${m.interval_minutes} 分钟</b></div>
-      </div>
-      <div class="muted small">上次检测：${fmtTime(m.last_check_at)}（${relTime(m.last_check_at)}） · 下次：${m.enabled ? relTime(m.next_run_at) : "-"}</div>
-      ${errorLine}`;
-  }
+  $("#model-body").innerHTML = list.map((m) => {
+    const th = m.baseline_ms ? m.baseline_ms * (1 + m.effective_threshold_pct / 100) : null;
+    const sel = state.selected.has(m.id);
+    return `<tr data-id="${m.id}" class="${sel ? "selected" : ""} ${m.enabled ? "" : "row-disabled"}">
+      <td class="col-check"><input type="checkbox" data-id="${m.id}" ${sel ? "checked" : ""} aria-label="选择"></td>
+      <td class="nowrap">${statusCell(m)}</td>
+      <td><div class="model-name">${esc(m.name)}</div><div class="muted small">${esc(m.deployment)}</div></td>
+      <td>${esc(m.resource_name)}</td>
+      <td class="nowrap">${KIND[m.kind]}</td>
+      <td class="num nowrap">${ttftCell(m)}</td>
+      <td class="num nowrap">${baselineText(m)}<div class="muted small">${th ? `> ${fmtMs(th)}` : ""}</div></td>
+      <td class="num">${fmtPct(m.availability_24h)}</td>
+      <td class="num">${fmtPct(m.availability_7d)}</td>
+      <td>${sparkSvg(m)}</td>
+      <td class="small nowrap" title="${fmtTime(m.last_check_at)}">${relTime(m.last_check_at)}<div class="muted">${m.enabled ? `下次 ${relTime(m.next_run_at)}` : ""}</div></td>
+      <td class="col-actions nowrap">
+        <button class="btn small" data-act="run">检测</button><button class="btn small" data-act="detail">详情</button><button class="btn small" data-act="edit">编辑</button><button class="btn small danger" data-act="delete">删除</button>
+      </td></tr>`;
+  }).join("");
+  syncBulkBar(list);
 }
 
-function chartConfig(m, checks, big) {
+function syncBulkBar(list = sortModels(filteredModels())) {
+  const n = state.selected.size;
+  $("#bulk-bar").classList.toggle("hidden", n === 0);
+  $("#bulk-count").textContent = `已选 ${n} 个模型`;
+  const visible = list.map((m) => m.id);
+  const checkedVisible = visible.filter((id) => state.selected.has(id)).length;
+  const all = $("#m-check-all");
+  all.checked = visible.length > 0 && checkedVisible === visible.length;
+  all.indeterminate = checkedVisible > 0 && checkedVisible < visible.length;
+}
+
+// filters / sorting / selection
+$("#summary").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-status]");
+  if (!b) return;
+  state.filter.status = state.filter.status === b.dataset.status ? "" : b.dataset.status;
+  saveFilters();
+  renderSummary();
+  renderTable();
+});
+for (const [id, key, ev] of [["#f-search", "search", "input"], ["#f-kind", "kind", "change"], ["#f-resource", "resource", "change"]]) {
+  $(id).value = state.filter[key];
+  $(id).addEventListener(ev, (e) => {
+    state.filter[key] = e.target.value;
+    saveFilters();
+    renderTable();
+  });
+}
+$("#f-abnormal").checked = state.filter.abnormal;
+$("#f-abnormal").addEventListener("change", (e) => {
+  state.filter.abnormal = e.target.checked;
+  saveFilters();
+  renderTable();
+});
+$(".models-table thead").addEventListener("click", (e) => {
+  const th = e.target.closest("th[data-sort]");
+  if (!th) return;
+  const key = th.dataset.sort;
+  state.sort = { key, dir: state.sort.key === key ? -state.sort.dir : 1 };
+  renderTable();
+});
+$("#m-check-all").addEventListener("change", (e) => {
+  for (const m of filteredModels()) e.target.checked ? state.selected.add(m.id) : state.selected.delete(m.id);
+  renderTable();
+});
+$("#bulk-clear").addEventListener("click", () => {
+  state.selected.clear();
+  renderTable();
+});
+$("#bulk-bar").addEventListener("click", async (e) => {
+  const action = e.target.dataset.bulk;
+  if (!action) return;
+  const ids = [...state.selected];
+  const label = { run: "立即检测", enable: "启用", disable: "停用", delete: "删除" }[action];
+  const warn = action === "delete" ? "\n删除会同时清除这些模型的全部历史数据，不可恢复。" : "";
+  if (!confirm(`确定对选中的 ${ids.length} 个模型执行「${label}」？${warn}`)) return;
+  try {
+    const r = await api("/api/models/bulk", { method: "POST", body: { ids, action } });
+    if (action === "delete") state.selected.clear();
+    if (action === "run" && r.affected < r.matched) alert(`已触发 ${r.affected} 个；其余模型已停用或正在检测中。`);
+  } catch (err) {
+    alert(err.message);
+  }
+  loadDashboard();
+});
+$("#model-body").addEventListener("change", (e) => {
+  const id = Number(e.target.dataset.id);
+  if (!id) return;
+  e.target.checked ? state.selected.add(id) : state.selected.delete(id);
+  e.target.closest("tr").classList.toggle("selected", e.target.checked);
+  syncBulkBar();
+});
+$("#model-body").addEventListener("click", async (e) => {
+  const act = e.target.closest("button")?.dataset.act;
+  if (!act) return;
+  const id = Number(e.target.closest("tr").dataset.id);
+  const m = state.models.find((x) => x.id === id);
+  if (act === "run") {
+    try {
+      await api(`/api/models/${id}/run`, { method: "POST" });
+    } catch (err) {
+      alert(err.message);
+    }
+    loadDashboard();
+  } else if (act === "edit") {
+    openModelDialog(m);
+  } else if (act === "delete") {
+    if (confirm(`确定删除「${m.name}」及其全部历史数据？`)) {
+      await api(`/api/models/${id}`, { method: "DELETE" }).catch((err) => alert(err.message));
+      state.selected.delete(id);
+      loadDashboard();
+    }
+  } else if (act === "detail") {
+    state.detailId = id;
+    $("#detail-dialog").showModal();
+    refreshDetail();
+  }
+});
+
+// ---------- detail ----------
+function chartConfig(m, checks) {
   const okPts = [], anomalyPts = [], failPts = [];
   for (const c of checks) {
     const x = c.ts * 1000;
@@ -218,9 +396,9 @@ function chartConfig(m, checks, big) {
   const xMin = xs.length ? Math.min(...xs) : Date.now() - 3600e3;
   const xMax = xs.length ? Math.max(...xs) : Date.now();
   const datasets = [
-    { type: "line", label: "TTFT", data: line, borderColor: "#3b82f6", backgroundColor: "#3b82f6", pointRadius: big ? 3 : 2, borderWidth: 1.5, tension: 0.2 },
-    { type: "scatter", label: "TTFT 异常", data: anomalyPts, backgroundColor: "#f59e0b", pointRadius: big ? 5 : 3 },
-    { type: "scatter", label: "失败", data: failPts, backgroundColor: "#ef4444", pointStyle: "crossRot", borderColor: "#ef4444", pointRadius: big ? 6 : 4, borderWidth: 2 },
+    { type: "line", label: "TTFT", data: line, borderColor: "#3b82f6", backgroundColor: "#3b82f6", pointRadius: 3, borderWidth: 1.5, tension: 0.2 },
+    { type: "scatter", label: "TTFT 异常", data: anomalyPts, backgroundColor: "#f59e0b", pointRadius: 5 },
+    { type: "scatter", label: "失败", data: failPts, backgroundColor: "#ef4444", pointStyle: "crossRot", borderColor: "#ef4444", pointRadius: 6, borderWidth: 2 },
   ];
   if (m.baseline_ms) {
     datasets.push({ type: "line", label: "基线", data: [{ x: xMin, y: m.baseline_ms }, { x: xMax, y: m.baseline_ms }], borderColor: "#10b981", borderDash: [4, 4], pointRadius: 0, borderWidth: 1 });
@@ -234,11 +412,11 @@ function chartConfig(m, checks, big) {
       maintainAspectRatio: false,
       parsing: false,
       scales: {
-        x: { type: "linear", min: xMin, max: xMax, ticks: { callback: (v) => fmtShort(v), maxTicksLimit: big ? 8 : 4, font: { size: 10 } } },
+        x: { type: "linear", min: xMin, max: xMax, ticks: { callback: (v) => fmtShort(v), maxTicksLimit: 8, font: { size: 10 } } },
         y: { beginAtZero: true, ticks: { callback: (v) => fmtMs(v), font: { size: 10 } } },
       },
       plugins: {
-        legend: { display: big, labels: { boxWidth: 10 } },
+        legend: { display: true, labels: { boxWidth: 10 } },
         tooltip: {
           callbacks: {
             title: (items) => fmtTime(items[0].raw.x / 1000),
@@ -255,64 +433,16 @@ function chartConfig(m, checks, big) {
   };
 }
 
-async function loadCardChart(m, hours) {
-  const card = $(`.model-card[data-id="${m.id}"]`);
-  if (!card) return;
-  let checks;
-  try {
-    checks = await api(`/api/models/${m.id}/checks?hours=${hours}`);
-  } catch {
-    return;
-  }
-  const cfg = chartConfig(m, checks, false);
-  const old = state.charts.get(m.id);
-  if (old) {
-    old.data = cfg.data;
-    old.options = cfg.options;
-    old.update("none");
-  } else {
-    state.charts.set(m.id, new Chart($("canvas", card), cfg));
-  }
-}
-
-async function onCardAction(e, id) {
-  const act = e.target.closest("button")?.dataset.act;
-  if (!act) return;
-  const m = state.models.find((x) => x.id === id);
-  if (act === "run") {
-    try {
-      await api(`/api/models/${id}/run`, { method: "POST" });
-    } catch (err) {
-      alert(err.message);
-    }
-    loadDashboard();
-  } else if (act === "edit") {
-    openModelDialog(m);
-  } else if (act === "delete") {
-    if (confirm(`确定删除「${m.name}」及其全部历史数据？`)) {
-      await api(`/api/models/${id}`, { method: "DELETE" }).catch((err) => alert(err.message));
-      loadDashboard();
-    }
-  } else if (act === "detail") {
-    state.detailId = id;
-    $("#detail-dialog").showModal();
-    refreshDetail();
-  }
-}
-$("#range-select").addEventListener("change", loadDashboard);
-
-// ---------- detail ----------
 let detailChart = null;
 async function refreshDetail() {
   const m = state.models.find((x) => x.id === state.detailId);
   if (!m) return;
-  const hours = Number($("#range-select").value);
+  const hours = Number($("#detail-range").value);
   $("#detail-title").textContent = m.name;
-  $("#detail-meta").innerHTML = `${KIND[m.kind]} · 部署 ${esc(m.deployment)} · Key ${esc(m.api_key_masked)}<br>请求地址：<code>${esc(m.request_url)}</code>${m.kind === "text" ? ` · token 参数：<code>${esc(m.token_param)}</code>` : ""}`;
+  $("#detail-meta").innerHTML = `${KIND[m.kind]} · 资源 ${esc(m.resource_name)} · 部署 ${esc(m.deployment)}<br>请求地址：<code>${esc(m.request_url)}</code>${m.kind === "text" ? ` · token 参数：<code>${esc(m.token_param)}</code>` : ""}`;
   const checks = await api(`/api/models/${m.id}/checks?hours=${hours}`).catch(() => []);
-  const cfg = chartConfig(m, checks, true);
   if (detailChart) detailChart.destroy();
-  detailChart = new Chart($("#detail-chart"), cfg);
+  detailChart = new Chart($("#detail-chart"), chartConfig(m, checks));
   const trig = { schedule: "定时", manual: "手动" };
   $("#detail-body").innerHTML = [...checks].reverse().slice(0, 300).map((c) => {
     const res = !c.success ? '<span class="badge bad">失败</span>' : c.anomaly ? '<span class="badge warn">超标</span>' : '<span class="badge ok">正常</span>';
@@ -324,6 +454,7 @@ async function refreshDetail() {
       <td>${fmtMs(c.ttft_ms)}</td><td>${fmtMs(c.total_ms)}</td><td>${conc}</td><td>${c.http_status ?? "-"}</td><td class="err-cell" title="${esc(c.error)}">${esc(c.error || "")}</td></tr>`;
   }).join("") || '<tr><td colspan="9" class="muted">暂无数据</td></tr>';
 }
+$("#detail-range").addEventListener("change", refreshDetail);
 $("#detail-close").addEventListener("click", () => {
   $("#detail-dialog").close();
   state.detailId = null;
@@ -336,22 +467,31 @@ $("#detail-reset-baseline").addEventListener("click", async () => {
 
 // ---------- model form ----------
 async function openModelDialog(m) {
+  const resources = await api("/api/resources").catch(() => []);
+  if (!resources.length) {
+    alert("请先在“资源”页添加 Azure 资源（端点 + API Key），再添加模型。");
+    location.hash = "#resources";
+    return;
+  }
   const form = $("#model-form");
   form.reset();
   $("#model-form-error").textContent = "";
   state.editingId = m ? m.id : null;
   $("#model-dialog-title").textContent = m ? "编辑模型" : "添加模型";
-  form.api_key.placeholder = m ? `已保存 ${m.api_key_masked}，留空保持不变` : "";
-  form.api_key.required = !m;
+  form.resource_id.innerHTML = resources.map((r) => `<option value="${r.id}">${esc(r.name)}</option>`).join("");
   if (m) {
-    for (const k of ["name", "kind", "endpoint", "deployment", "interval_minutes"]) form[k].value = m[k];
+    for (const k of ["name", "kind", "deployment", "interval_minutes", "resource_id"]) form[k].value = m[k];
     form.ttft_threshold_pct.value = m.ttft_threshold_pct ?? "";
     form.baseline_manual_ms.value = m.baseline_manual_ms ?? "";
+    form.endpoint_override.value = m.endpoint_override ?? "";
     form.enabled.checked = m.enabled;
+    $(".advanced", form).open = Boolean(m.endpoint_override);
   } else {
     const s = await api("/api/settings").catch(() => ({}));
     form.interval_minutes.value = s.default_interval_minutes || 30;
     form.enabled.checked = true;
+    if (state.filter.resource) form.resource_id.value = state.filter.resource;
+    $(".advanced", form).open = false;
   }
   $("#model-dialog").showModal();
 }
@@ -364,9 +504,9 @@ $("#model-form").addEventListener("submit", async (e) => {
   const body = {
     name: f.name.value,
     kind: f.kind.value,
-    endpoint: f.endpoint.value,
+    resource_id: Number(f.resource_id.value),
     deployment: f.deployment.value,
-    api_key: f.api_key.value || null,
+    endpoint_override: f.endpoint_override.value.trim() || null,
     enabled: f.enabled.checked,
     interval_minutes: Number(f.interval_minutes.value),
     ttft_threshold_pct: num(f.ttft_threshold_pct.value),
@@ -379,6 +519,144 @@ $("#model-form").addEventListener("submit", async (e) => {
     loadDashboard();
   } catch (err) {
     $("#model-form-error").textContent = err.message;
+  }
+});
+$("#model-form").deployment.addEventListener("input", (e) => {
+  const name = $("#model-form").name;
+  if (!state.editingId && (!name.value || name.dataset.auto === "1")) {
+    name.value = e.target.value;
+    name.dataset.auto = "1";
+  }
+});
+$("#model-form").name.addEventListener("input", (e) => (e.target.dataset.auto = "0"));
+
+// ---------- import ----------
+let importPreviewed = false;
+$("#import-btn").addEventListener("click", () => {
+  $("#import-msg").textContent = "";
+  $("#import-body").innerHTML = "";
+  $("#import-run-btn").disabled = true;
+  importPreviewed = false;
+  $("#import-dialog").showModal();
+});
+$("#import-close").addEventListener("click", () => $("#import-dialog").close());
+$("#import-text").addEventListener("input", () => {
+  importPreviewed = false;
+  $("#import-run-btn").disabled = true;
+});
+$("#import-file").addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  e.target.value = "";
+  if (!file) return;
+  if (file.size > 500_000) return alert("文件过大（上限 500KB）");
+  const buf = await file.arrayBuffer();
+  let text;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(buf);
+  } catch {
+    text = new TextDecoder("gbk").decode(buf); // Excel on Chinese Windows saves CSV as GBK
+  }
+  $("#import-text").value = text;
+  $("#import-text").dispatchEvent(new Event("input"));
+  runImport(true);
+});
+$("#import-preview-btn").addEventListener("click", () => runImport(true));
+$("#import-run-btn").addEventListener("click", () => {
+  if (importPreviewed) runImport(false);
+});
+async function runImport(dryRun) {
+  const msg = $("#import-msg");
+  msg.className = "small";
+  msg.textContent = dryRun ? "解析中…" : "导入中…";
+  try {
+    const r = await api("/api/models/import", { method: "POST", body: { text: $("#import-text").value, dry_run: dryRun } });
+    const s = r.summary;
+    const label = { ok: '<span class="badge ok">可导入</span>', duplicate: '<span class="badge muted">跳过</span>', error: '<span class="badge bad">错误</span>' };
+    $("#import-body").innerHTML = r.rows.map((x) => `<tr><td>${x.line}</td><td>${label[x.status]}</td><td>${esc(x.resource)}</td><td>${esc(x.name)}</td>
+      <td>${KIND[x.kind] || esc(x.kind)}</td><td>${esc(x.deployment)}</td><td>${x.interval ?? ""}</td><td>${x.threshold ?? ""}</td><td class="small">${esc(x.message)}</td></tr>`).join("");
+    if (dryRun) {
+      importPreviewed = true;
+      $("#import-run-btn").disabled = s.ok === 0;
+      $("#import-run-btn").textContent = `导入 ${s.ok} 个`;
+      msg.textContent = `可导入 ${s.ok} 个，跳过 ${s.duplicate} 个重复，${s.error} 行有错误${s.error ? "（有错误的行不会导入）" : ""}。`;
+    } else {
+      importPreviewed = false;
+      $("#import-run-btn").disabled = true;
+      msg.className = "small success";
+      msg.textContent = `已导入 ${r.created} 个模型，首次检测会在 5 分钟内陆续开始。`;
+      loadDashboard();
+    }
+  } catch (err) {
+    msg.className = "small error";
+    msg.textContent = err.message;
+  }
+}
+
+// ---------- resources ----------
+async function loadResources() {
+  const [resources, dash] = await Promise.all([api("/api/resources").catch(() => []), api("/api/dashboard?spark_hours=1").catch(() => null)]);
+  if (dash) state.models = dash.models;
+  state.resources = resources;
+  $("#resource-body").innerHTML = resources.map((r) => {
+    const ms = state.models.filter((m) => m.resource_id === r.id);
+    const n = (st) => ms.filter((m) => effStatus(m) === st).length;
+    const stat = [["ok", "ok", "正常"], ["slow", "warn", "TTFT 异常"], ["down", "bad", "失败"]]
+      .filter(([st]) => n(st)).map(([st, cls, lbl]) => `<span class="badge ${cls}">${lbl} ${n(st)}</span>`).join(" ") || '<span class="muted">-</span>';
+    return `<tr data-id="${r.id}"><td><b>${esc(r.name)}</b></td><td><code>${esc(r.endpoint)}</code></td><td><code>${esc(r.api_key_masked)}</code></td>
+      <td class="num">${r.model_count}</td><td>${stat}</td>
+      <td class="col-actions nowrap"><button class="btn small" data-act="models">查看模型</button><button class="btn small" data-act="edit">编辑</button><button class="btn small danger" data-act="delete">删除</button></td></tr>`;
+  }).join("") || '<tr><td colspan="6" class="muted empty-row">还没有资源。点击右上角“添加资源”，填写 Foundry 资源的端点和 API Key。</td></tr>';
+}
+$("#resource-body").addEventListener("click", async (e) => {
+  const act = e.target.closest("button")?.dataset.act;
+  if (!act) return;
+  const id = Number(e.target.closest("tr").dataset.id);
+  const r = state.resources.find((x) => x.id === id);
+  if (act === "models") {
+    Object.assign(state.filter, { resource: String(id), status: "", abnormal: false, search: "" });
+    saveFilters();
+    $("#f-search").value = "";
+    $("#f-abnormal").checked = false;
+    location.hash = "#dashboard";
+  } else if (act === "edit") {
+    openResourceDialog(r);
+  } else if (act === "delete") {
+    if (!confirm(`确定删除资源「${r.name}」？`)) return;
+    try {
+      await api(`/api/resources/${id}`, { method: "DELETE" });
+    } catch (err) {
+      alert(err.message);
+    }
+    loadResources();
+  }
+});
+function openResourceDialog(r) {
+  const f = $("#resource-form");
+  f.reset();
+  $("#resource-form-error").textContent = "";
+  state.editingResourceId = r ? r.id : null;
+  $("#resource-dialog-title").textContent = r ? "编辑资源" : "添加资源";
+  f.api_key.required = !r;
+  f.api_key.placeholder = r ? `已保存 ${r.api_key_masked}，留空保持不变` : "";
+  if (r) {
+    f.name.value = r.name;
+    f.endpoint.value = r.endpoint;
+  }
+  $("#resource-dialog").showModal();
+}
+$("#add-resource-btn").addEventListener("click", () => openResourceDialog(null));
+$("#resource-cancel").addEventListener("click", () => $("#resource-dialog").close());
+$("#resource-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  const body = { name: f.name.value, endpoint: f.endpoint.value, api_key: f.api_key.value || null };
+  try {
+    if (state.editingResourceId) await api(`/api/resources/${state.editingResourceId}`, { method: "PUT", body });
+    else await api("/api/resources", { method: "POST", body });
+    $("#resource-dialog").close();
+    loadResources();
+  } catch (err) {
+    $("#resource-form-error").textContent = err.message;
   }
 });
 

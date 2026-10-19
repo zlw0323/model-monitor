@@ -7,20 +7,21 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import config
+from . import config, importer
 from .crypto import decrypt, encrypt, mask
 from .db import Database
 from .feishu import FeishuNotConfigured, Notice, is_webhook_url, mask_webhook
 from .feishu import send as send_feishu
 from .mailer import MailNotConfigured, send_mail
 from .monitor import Monitor
-from .probes import build_url, deployment_from_endpoint
+from .probes import build_url
 from .scheduling import next_slot
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -54,18 +55,41 @@ FLOAT_SETTINGS = {"ttft_threshold_pct": (1, 10000)}
 TEXT_SETTINGS = ("smtp_host", "smtp_username", "smtp_from", "smtp_to")
 
 
+def _check_url(v: str) -> str:
+    u = urlsplit(v if "://" in v else "https://" + v)
+    if u.scheme not in ("http", "https") or not u.hostname:
+        raise ValueError("必须是 http(s) 地址")
+    return v
+
+
 class ModelIn(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     kind: Literal["text", "image"]
-    endpoint: str = Field(min_length=1, max_length=1000)
-    deployment: str = Field("", max_length=200)
-    api_key: str | None = Field(None, max_length=500)
+    resource_id: int
+    deployment: str = Field(min_length=1, max_length=200)
+    endpoint_override: str | None = Field(None, max_length=1000)
     enabled: bool = True
     interval_minutes: int = Field(30, ge=1, le=1440)
     ttft_threshold_pct: float | None = Field(None, gt=0, le=10000)
     baseline_manual_ms: float | None = Field(None, gt=0)
 
-    @field_validator("name", "endpoint", "deployment", "api_key")
+    @field_validator("name", "deployment", "endpoint_override", mode="before")
+    @classmethod
+    def _strip(cls, v):
+        return v.strip() if isinstance(v, str) else v
+
+    @field_validator("endpoint_override")
+    @classmethod
+    def _check_override(cls, v: str | None) -> str | None:
+        return _check_url(v) if v else None
+
+
+class ResourceIn(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    endpoint: str = Field(min_length=1, max_length=1000)
+    api_key: str | None = Field(None, max_length=500)
+
+    @field_validator("name", "endpoint", "api_key", mode="before")
     @classmethod
     def _strip(cls, v):
         return v.strip() if isinstance(v, str) else v
@@ -73,10 +97,17 @@ class ModelIn(BaseModel):
     @field_validator("endpoint")
     @classmethod
     def _check_endpoint(cls, v: str) -> str:
-        u = urlsplit(v if "://" in v else "https://" + v)
-        if u.scheme not in ("http", "https") or not u.hostname:
-            raise ValueError("endpoint 必须是 http(s) 地址")
-        return v
+        return _check_url(v)
+
+
+class ImportIn(BaseModel):
+    text: str = Field(max_length=500_000)
+    dry_run: bool = True
+
+
+class BulkIn(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=1000)
+    action: Literal["run", "enable", "disable", "delete"]
 
 
 class LoginIn(BaseModel):
@@ -101,6 +132,13 @@ class AlertDeleteIn(BaseModel):
 
 def _host(endpoint: str) -> str:
     return (urlsplit(endpoint if "://" in endpoint else "https://" + endpoint).hostname or "").lower()
+
+
+def _origin(endpoint: str) -> tuple[str, str, int]:
+    """Scheme, host and port: a stored key may only be sent to the same origin, never downgraded to http."""
+    u = urlsplit(endpoint if "://" in endpoint else "https://" + endpoint)
+    scheme = (u.scheme or "https").lower()
+    return scheme, (u.hostname or "").lower(), u.port or (443 if scheme == "https" else 80)
 
 
 class _LoginThrottle:
@@ -149,6 +187,7 @@ def create_app(
         same_site="lax",
         https_only=config.COOKIE_SECURE,
     )
+    app.add_middleware(GZipMiddleware, minimum_size=2048)
     throttle = _LoginThrottle()
 
     def db_dep(request: Request) -> Database:
@@ -194,29 +233,27 @@ def create_app(
     def me(user: str = Depends(require_login)):
         return {"user": user}
 
-    # ---- models ----
-    def serialize(m: dict, db: Database, monitor: Monitor, settings: dict[str, str]) -> dict:
-        now = time.time()
-        auto, samples = db.auto_baseline(m, int(settings["baseline_window"]), int(settings["baseline_min_samples"]))
+    # ---- models & resources ----
+    def baseline_info(m: dict, settings: dict[str, str]) -> tuple[float | None, str]:
         if m["baseline_manual_ms"]:
-            baseline, source = m["baseline_manual_ms"], "manual"
-        else:
-            baseline, source = auto, ("auto" if auto else "learning")
-        try:
-            key_mask = mask(decrypt(m["api_key_enc"]))
-        except RuntimeError:
-            key_mask = "（无法解密）"
-        latest = db.latest_check(m["id"])
-        a24, n24 = db.availability(m["id"], now - 86400)
-        a7, n7 = db.availability(m["id"], now - 7 * 86400)
-        return {
+            return m["baseline_manual_ms"], "manual"
+        if m["baseline_auto_ms"]:
+            return m["baseline_auto_ms"], "auto"
+        return None, "learning"
+
+    def serialize(m: dict, monitor: Monitor, settings: dict[str, str], latest: dict | None,
+                  avail: dict | None, spark: list | None = None) -> dict:
+        baseline, source = baseline_info(m, settings)
+        avail = avail or {}
+        out = {
             "id": m["id"],
             "name": m["name"],
             "kind": m["kind"],
-            "endpoint": m["endpoint"],
+            "resource_id": m["resource_id"],
+            "resource_name": m["resource_name"],
             "deployment": m["deployment"],
+            "endpoint_override": m["endpoint_override"],
             "request_url": build_url(m["endpoint"], m["kind"]),
-            "api_key_masked": key_mask,
             "enabled": bool(m["enabled"]),
             "interval_minutes": m["interval_minutes"],
             "ttft_threshold_pct": m["ttft_threshold_pct"],
@@ -224,7 +261,7 @@ def create_app(
             "baseline_manual_ms": m["baseline_manual_ms"],
             "baseline_ms": baseline,
             "baseline_source": source,
-            "baseline_samples": samples,
+            "baseline_samples": m["baseline_samples"],
             "baseline_min_samples": int(settings["baseline_min_samples"]),
             "token_param": m["token_param"],
             "status": m["status"],
@@ -233,10 +270,32 @@ def create_app(
             "last_check_at": m["last_check_at"],
             "next_run_at": m["next_run_at"] if m["enabled"] else None,
             "latest": latest,
-            "availability_24h": a24,
-            "cycles_24h": n24,
-            "availability_7d": a7,
-            "cycles_7d": n7,
+            "availability_24h": avail.get("short"),
+            "cycles_24h": avail.get("n_short", 0),
+            "availability_7d": avail.get("long"),
+            "cycles_7d": avail.get("n_long", 0),
+        }
+        if spark is not None:
+            out["spark"] = spark
+        return out
+
+    def serialize_one(db: Database, monitor: Monitor, model_id: int) -> dict:
+        now = time.time()
+        m = db.get_model(model_id)
+        return serialize(m, monitor, db.get_settings(), db.latest_checks().get(model_id),
+                         db.availability_all(now - 86400, now - 7 * 86400).get(model_id))
+
+    def serialize_resource(r: dict) -> dict:
+        try:
+            key_mask = mask(decrypt(r["api_key_enc"]))
+        except RuntimeError:
+            key_mask = "（无法解密，请重新填写）"
+        return {
+            "id": r["id"],
+            "name": r["name"],
+            "endpoint": r["endpoint"],
+            "api_key_masked": key_mask,
+            "model_count": r.get("model_count", 0),
         }
 
     def get_or_404(db: Database, model_id: int) -> dict:
@@ -245,30 +304,62 @@ def create_app(
             raise HTTPException(404, "模型不存在")
         return m
 
-    def resolve_deployment(body: ModelIn) -> str:
-        dep = body.deployment or deployment_from_endpoint(body.endpoint) or ""
-        if not dep:
-            raise HTTPException(422, "请填写部署名称（Foundry 中的 Deployment name）")
-        return dep
+    def resource_or_422(db: Database, resource_id: int) -> dict:
+        r = db.get_resource(resource_id)
+        if not r:
+            raise HTTPException(422, "所选资源不存在")
+        return r
+
+    def check_override(resource: dict, override: str | None) -> None:
+        # The resource's key is sent to the override URL, so it must stay on the resource's own origin.
+        if override and _origin(override) != _origin(resource["endpoint"]):
+            raise HTTPException(422, "自定义请求地址必须与资源端点是同一个主机（协议和端口也须一致）")
+
+    def check_duplicate(db: Database, resource_id: int, deployment: str, kind: str, exclude_id: int | None = None):
+        for m in db.models_of_resource(resource_id):
+            if m["id"] != exclude_id and m["deployment"].lower() == deployment.lower() and m["kind"] == kind:
+                raise HTTPException(409, f"该资源下已存在部署「{deployment}」的同类型模型：{m['name']}")
+
+    def soon(model_id: int, window_seconds: float) -> float:
+        # Spread first checks of many models over a short window instead of firing them all at once.
+        return time.time() + 5 + ((model_id * 0.6180339887498949) % 1.0) * window_seconds
+
+    @app.get("/api/dashboard")
+    def dashboard(
+        spark_hours: float = 24, _: str = Depends(require_login), db: Database = Depends(db_dep),
+        mon: Monitor = Depends(mon_dep),
+    ):
+        now = time.time()
+        s = db.get_settings()
+        latest = db.latest_checks()
+        avail = db.availability_all(now - 86400, now - 7 * 86400)
+        spark = db.sparklines(now - min(max(spark_hours, 1), 24 * 7) * 3600, 48)
+        models = [serialize(m, mon, s, latest.get(m["id"]), avail.get(m["id"]), spark.get(m["id"], []))
+                  for m in db.list_models()]
+        resources = [{"id": r["id"], "name": r["name"], "model_count": r["model_count"]} for r in db.list_resources()]
+        return {"models": models, "resources": resources, "now": now}
 
     @app.get("/api/models")
     def list_models(_: str = Depends(require_login), db: Database = Depends(db_dep), mon: Monitor = Depends(mon_dep)):
-        s = db.get_settings()
-        return [serialize(m, db, mon, s) for m in db.list_models()]
+        now = time.time()
+        s, latest = db.get_settings(), db.latest_checks()
+        avail = db.availability_all(now - 86400, now - 7 * 86400)
+        return [serialize(m, mon, s, latest.get(m["id"]), avail.get(m["id"])) for m in db.list_models()]
 
     @app.post("/api/models")
     def create_model(
         body: ModelIn, _: str = Depends(require_login), db: Database = Depends(db_dep), mon: Monitor = Depends(mon_dep)
     ):
-        if not body.api_key:
-            raise HTTPException(422, "请填写 API Key")
+        resource = resource_or_422(db, body.resource_id)
+        check_override(resource, body.endpoint_override)
+        check_duplicate(db, body.resource_id, body.deployment, body.kind)
         model_id = db.insert_model(
             {
                 "name": body.name,
                 "kind": body.kind,
-                "endpoint": body.endpoint,
-                "deployment": resolve_deployment(body),
-                "api_key_enc": encrypt(body.api_key),
+                "resource_id": body.resource_id,
+                "deployment": body.deployment,
+                "endpoint_override": body.endpoint_override,
                 "enabled": int(body.enabled),
                 "interval_minutes": body.interval_minutes,
                 "ttft_threshold_pct": body.ttft_threshold_pct,
@@ -276,7 +367,7 @@ def create_app(
                 "next_run_at": time.time(),
             }
         )
-        return serialize(db.get_model(model_id), db, mon, db.get_settings())
+        return serialize_one(db, mon, model_id)
 
     @app.put("/api/models/{model_id}")
     def update_model(
@@ -287,37 +378,90 @@ def create_app(
         mon: Monitor = Depends(mon_dep),
     ):
         old = get_or_404(db, model_id)
+        resource = resource_or_422(db, body.resource_id)
+        check_override(resource, body.endpoint_override)
+        check_duplicate(db, body.resource_id, body.deployment, body.kind, exclude_id=model_id)
         fields: dict[str, Any] = {
             "name": body.name,
             "kind": body.kind,
-            "endpoint": body.endpoint,
-            "deployment": resolve_deployment(body),
+            "resource_id": body.resource_id,
+            "deployment": body.deployment,
+            "endpoint_override": body.endpoint_override,
             "enabled": int(body.enabled),
             "interval_minutes": body.interval_minutes,
             "ttft_threshold_pct": body.ttft_threshold_pct,
             "baseline_manual_ms": body.baseline_manual_ms,
         }
-        if body.api_key:
-            fields["api_key_enc"] = encrypt(body.api_key)
-        elif _host(old["endpoint"]) != _host(body.endpoint):
-            # Otherwise anyone holding a session could redirect the stored key to a host they control.
-            raise HTTPException(422, "端点主机已变更，请重新填写 API Key")
-        target_changed = any(old[k] != fields[k] for k in ("kind", "endpoint", "deployment"))
+        target_changed = any(old[k] != fields[k] for k in ("kind", "resource_id", "deployment", "endpoint_override"))
         if target_changed:
             # A different target makes the learned baseline and token-param detection meaningless.
-            fields.update(baseline_reset_at=time.time(), token_param="max_completion_tokens", status="unknown")
-        if target_changed or body.api_key or (body.enabled and not old["enabled"]):
+            fields.update(baseline_reset_at=time.time(), baseline_auto_ms=None, baseline_samples=0,
+                          token_param="max_completion_tokens", status="unknown")
+        if target_changed or (body.enabled and not old["enabled"]):
             fields["next_run_at"] = time.time()
         elif body.interval_minutes != old["interval_minutes"]:
             fields["next_run_at"] = next_slot(model_id, body.interval_minutes, time.time())
         db.update_model(model_id, fields)
-        return serialize(db.get_model(model_id), db, mon, db.get_settings())
+        return serialize_one(db, mon, model_id)
 
     @app.delete("/api/models/{model_id}")
     def delete_model(model_id: int, _: str = Depends(require_login), db: Database = Depends(db_dep)):
         get_or_404(db, model_id)
         db.delete_model(model_id)
         return {"ok": True}
+
+    @app.post("/api/models/bulk")
+    async def bulk_models(body: BulkIn, _: str = Depends(require_login), db: Database = Depends(db_dep),
+                          mon: Monitor = Depends(mon_dep)):
+        # async: "run" schedules check tasks, which needs the event loop (sync routes run in a thread pool)
+        known = {m["id"]: m for m in db.list_models()}
+        ids = [i for i in dict.fromkeys(body.ids) if i in known]
+        done = 0
+        if body.action == "delete":
+            done = db.delete_models(ids)
+        elif body.action == "disable":
+            for i in ids:
+                db.update_model(i, {"enabled": 0})
+            done = len(ids)
+        elif body.action == "enable":
+            for i in ids:
+                if not known[i]["enabled"]:
+                    db.update_model(i, {"enabled": 1, "next_run_at": soon(i, 120)})
+                    done += 1
+        else:  # run: the gate's concurrency limits keep a large selection from firing all at once
+            done = sum(1 for i in ids if known[i]["enabled"] and mon.trigger(i, "manual"))
+        return {"action": body.action, "matched": len(ids), "affected": done}
+
+    @app.get("/api/models/import-template")
+    def import_template(_: str = Depends(require_login)):
+        return Response(
+            "\ufeff" + importer.TEMPLATE,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="models-template.csv"'},
+        )
+
+    @app.post("/api/models/import")
+    def import_models(body: ImportIn, _: str = Depends(require_login), db: Database = Depends(db_dep)):
+        resources = {r["name"].lower(): r["id"] for r in db.list_resources()}
+        default_interval = int(db.get_settings().get("default_interval_minutes") or 30)
+        try:
+            rows = importer.parse(body.text, resources, db.model_keys(), default_interval)
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+        created = 0
+        if not body.dry_run:
+            for r in rows:
+                if r.status != "ok":
+                    continue
+                model_id = db.insert_model({
+                    "name": r.name, "kind": r.kind, "resource_id": r.resource_id, "deployment": r.deployment,
+                    "enabled": int(r.enabled), "interval_minutes": r.interval, "ttft_threshold_pct": r.threshold,
+                    "baseline_manual_ms": r.baseline,
+                })
+                db.update_model(model_id, {"next_run_at": soon(model_id, 300)})
+                created += 1
+        summary = {k: sum(1 for r in rows if r.status == k) for k in ("ok", "duplicate", "error")}
+        return {"dry_run": body.dry_run, "created": created, "summary": summary, "rows": [r.to_dict() for r in rows]}
 
     @app.post("/api/models/{model_id}/run")
     async def run_now(model_id: int, _: str = Depends(require_login), db: Database = Depends(db_dep), mon: Monitor = Depends(mon_dep)):
@@ -329,7 +473,7 @@ def create_app(
     @app.post("/api/models/{model_id}/reset-baseline")
     def reset_baseline(model_id: int, _: str = Depends(require_login), db: Database = Depends(db_dep)):
         get_or_404(db, model_id)
-        db.update_model(model_id, {"baseline_reset_at": time.time()})
+        db.update_model(model_id, {"baseline_reset_at": time.time(), "baseline_auto_ms": None, "baseline_samples": 0})
         return {"ok": True}
 
     @app.get("/api/models/{model_id}/checks")
@@ -339,6 +483,62 @@ def create_app(
         get_or_404(db, model_id)
         hours = min(max(hours, 1), 24 * 90)
         return list(reversed(db.list_checks(model_id, time.time() - hours * 3600)))
+
+    @app.get("/api/resources")
+    def list_resources(_: str = Depends(require_login), db: Database = Depends(db_dep)):
+        return [serialize_resource(r) for r in db.list_resources()]
+
+    def check_resource_name(db: Database, name: str, exclude_id: int | None = None) -> None:
+        if any(r["name"].lower() == name.lower() and r["id"] != exclude_id for r in db.list_resources()):
+            raise HTTPException(409, f"资源名称「{name}」已存在")
+
+    @app.post("/api/resources")
+    def create_resource(body: ResourceIn, _: str = Depends(require_login), db: Database = Depends(db_dep)):
+        if not body.api_key:
+            raise HTTPException(422, "请填写 API Key")
+        check_resource_name(db, body.name)
+        rid = db.insert_resource({"name": body.name, "endpoint": body.endpoint, "api_key_enc": encrypt(body.api_key)})
+        return serialize_resource({**db.get_resource(rid), "model_count": 0})
+
+    @app.put("/api/resources/{resource_id}")
+    def update_resource(resource_id: int, body: ResourceIn, _: str = Depends(require_login),
+                        db: Database = Depends(db_dep)):
+        old = db.get_resource(resource_id)
+        if not old:
+            raise HTTPException(404, "资源不存在")
+        check_resource_name(db, body.name, exclude_id=resource_id)
+        models = db.models_of_resource(resource_id)
+        if not body.api_key and _origin(old["endpoint"]) != _origin(body.endpoint):
+            # Otherwise anyone holding a session could redirect (or downgrade to http) the stored key.
+            raise HTTPException(422, "端点的主机、协议或端口已变更，请重新填写 API Key")
+        if _origin(old["endpoint"]) != _origin(body.endpoint):
+            bad = [m["name"] for m in models if m["endpoint_override"] and _origin(m["endpoint_override"]) != _origin(body.endpoint)]
+            if bad:
+                raise HTTPException(422, f"以下模型的自定义请求地址仍指向旧主机，请先修改：{'、'.join(bad[:5])}")
+        fields: dict[str, Any] = {"name": body.name, "endpoint": body.endpoint}
+        if body.api_key:
+            fields["api_key_enc"] = encrypt(body.api_key)
+        db.update_resource(resource_id, fields)
+        endpoint_changed = old["endpoint"] != body.endpoint
+        for m in models:
+            upd: dict[str, Any] = {}
+            if endpoint_changed:
+                upd.update(baseline_reset_at=time.time(), baseline_auto_ms=None, baseline_samples=0,
+                           token_param="max_completion_tokens", status="unknown")
+            if (endpoint_changed or body.api_key) and m["enabled"]:
+                upd["next_run_at"] = soon(m["id"], 120)  # verify the new endpoint/key soon, without a burst
+            db.update_model(m["id"], upd)
+        return serialize_resource({**db.get_resource(resource_id), "model_count": len(models)})
+
+    @app.delete("/api/resources/{resource_id}")
+    def delete_resource(resource_id: int, _: str = Depends(require_login), db: Database = Depends(db_dep)):
+        if not db.get_resource(resource_id):
+            raise HTTPException(404, "资源不存在")
+        n = len(db.models_of_resource(resource_id))
+        if n:
+            raise HTTPException(409, f"该资源下还有 {n} 个模型，请先删除或移到其他资源")
+        db.delete_resource(resource_id)
+        return {"ok": True}
 
     # ---- alerts ----
     @app.get("/api/alerts")
@@ -430,6 +630,9 @@ def create_app(
         elif body.feishu_secret:
             out["feishu_secret_enc"] = encrypt(body.feishu_secret.strip())
         db.set_settings(out)
+        if "baseline_window" in out or "baseline_min_samples" in out:
+            s = db.get_settings()
+            db.refresh_baseline_cache(None, int(s["baseline_window"]), int(s["baseline_min_samples"]))
         return public_settings(db)
 
     @app.post("/api/settings/test-email")

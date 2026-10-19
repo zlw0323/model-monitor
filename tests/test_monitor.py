@@ -27,9 +27,11 @@ class Harness:
         self.notices = []
         self.calls = 0
         self.monitor = Monitor(self.db, probe_fn=self._probe, mail_fn=self._mail, feishu_fn=self._feishu)
+        self.resource_id = self.db.insert_resource(
+            {"name": "r", "endpoint": "https://r.openai.azure.com/", "api_key_enc": encrypt("k")}
+        )
         self.model_id = self.db.insert_model(
-            {"name": "m1", "kind": "text", "endpoint": "https://r.openai.azure.com", "deployment": "d",
-             "api_key_enc": encrypt("k"), "interval_minutes": 30}
+            {"name": "m1", "kind": "text", "resource_id": self.resource_id, "deployment": "d", "interval_minutes": 30}
         )
 
     async def _probe(self, m, key):
@@ -287,8 +289,8 @@ def test_slots_are_spread_and_stable():
 def test_realign_on_start_spreads_checked_models(tmp_path):
     h = Harness(tmp_path)
     ids = [h.model_id] + [
-        h.db.insert_model({"name": f"m{i}", "kind": "text", "endpoint": "https://r.openai.azure.com", "deployment": "d",
-                           "api_key_enc": encrypt("k"), "interval_minutes": 30})
+        h.db.insert_model({"name": f"m{i}", "kind": "text", "resource_id": h.resource_id, "deployment": f"d{i}",
+                           "interval_minutes": 30})
         for i in range(5)
     ]
     past = time.time() - 3600

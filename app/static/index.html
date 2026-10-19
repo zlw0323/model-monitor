@@ -25,6 +25,7 @@
       <div class="brand">模型监控平台</div>
       <nav>
         <a href="#dashboard" data-tab="dashboard">监控面板</a>
+        <a href="#resources" data-tab="resources">资源</a>
         <a href="#alerts" data-tab="alerts">报警记录</a>
         <a href="#settings" data-tab="settings">设置</a>
       </nav>
@@ -33,19 +34,69 @@
 
     <main>
       <div id="tab-dashboard" class="tab">
+        <div class="summary chips" id="summary"></div>
         <div class="toolbar">
-          <div class="summary" id="summary"></div>
-          <div class="toolbar-right">
-            <select id="range-select" title="图表时间范围">
-              <option value="24">最近 24 小时</option>
-              <option value="168">最近 7 天</option>
-              <option value="720">最近 30 天</option>
+          <div class="filters">
+            <input id="f-search" type="search" placeholder="搜索名称 / 部署名称" autocomplete="off">
+            <select id="f-kind" title="类型">
+              <option value="">全部类型</option>
+              <option value="text">文本/推理</option>
+              <option value="image">图像</option>
             </select>
+            <select id="f-resource" title="资源"><option value="">全部资源</option></select>
+            <label class="checkbox"><input type="checkbox" id="f-abnormal"> 只看异常</label>
+          </div>
+          <div class="toolbar-right">
+            <button class="btn" id="import-btn">批量导入</button>
             <button class="btn primary" id="add-model-btn">+ 添加模型</button>
           </div>
         </div>
-        <div id="model-grid" class="grid"></div>
-        <p id="empty-hint" class="muted hidden">还没有模型。点击右上角“添加模型”，填入 Foundry 的端点、部署名称和 API Key。</p>
+        <div id="bulk-bar" class="bulk-bar hidden">
+          <span id="bulk-count"></span>
+          <button class="btn small" data-bulk="run">立即检测</button>
+          <button class="btn small" data-bulk="enable">启用</button>
+          <button class="btn small" data-bulk="disable">停用</button>
+          <button class="btn small danger" data-bulk="delete">删除</button>
+          <button class="btn small ghost-dark" id="bulk-clear">取消选择</button>
+        </div>
+        <div class="card table-card">
+          <div class="table-wrap">
+            <table class="table models-table">
+              <thead><tr>
+                <th class="col-check"><input type="checkbox" id="m-check-all" aria-label="全选"></th>
+                <th data-sort="status" class="sortable">状态</th>
+                <th data-sort="name" class="sortable">模型</th>
+                <th data-sort="resource" class="sortable">资源</th>
+                <th>类型</th>
+                <th data-sort="ttft" class="sortable num">最新 TTFT</th>
+                <th class="num">基线 / 预警</th>
+                <th data-sort="avail" class="sortable num">24h 可用率</th>
+                <th class="num">7 天</th>
+                <th>趋势</th>
+                <th data-sort="last" class="sortable">上次检测</th>
+                <th class="col-actions">操作</th>
+              </tr></thead>
+              <tbody id="model-body"></tbody>
+            </table>
+          </div>
+          <p id="empty-hint" class="muted empty-row hidden"></p>
+        </div>
+      </div>
+
+      <div id="tab-resources" class="tab hidden">
+        <div class="card">
+          <div class="detail-head">
+            <h2>Azure 资源</h2>
+            <button class="btn primary" id="add-resource-btn">+ 添加资源</button>
+          </div>
+          <p class="muted small">同一个资源下的所有部署共用端点和 API Key。更换 Key 只需在这里改一次，该资源下的模型会在 2 分钟内陆续用新 Key 检测。</p>
+          <div class="table-wrap">
+            <table class="table">
+              <thead><tr><th>名称</th><th>端点</th><th>API Key</th><th class="num">模型数</th><th>状态</th><th class="col-actions">操作</th></tr></thead>
+              <tbody id="resource-body"></tbody>
+            </table>
+          </div>
+        </div>
       </div>
 
       <div id="tab-alerts" class="tab hidden">
@@ -137,6 +188,10 @@
     <form id="model-form" method="dialog">
       <h2 id="model-dialog-title">添加模型</h2>
       <div class="form-grid">
+        <label>Azure 资源<select name="resource_id" required></select>
+          <small class="muted">没有合适的资源？先到“资源”页添加。</small>
+        </label>
+        <label>部署名称 Deployment<input name="deployment" required maxlength="200" placeholder="gpt-5"></label>
         <label>显示名称<input name="name" required maxlength="100" placeholder="GPT-5 美东2"></label>
         <label>模型类型
           <select name="kind">
@@ -144,17 +199,18 @@
             <option value="image">图像模型（TTFT = 完整出图耗时，low / 1024x1024 / JPEG）</option>
           </select>
         </label>
-        <label class="span2">端点 Endpoint
-          <input name="endpoint" required placeholder="https://your-resource.openai.azure.com/">
-          <small class="muted">支持 *.openai.azure.com / *.services.ai.azure.com / *.cognitiveservices.azure.com，自动使用 v1 API（/openai/v1）；也可粘贴完整请求 URL。</small>
-        </label>
-        <label>部署名称 Deployment<input name="deployment" maxlength="200" placeholder="gpt-5"></label>
-        <label>API Key<input name="api_key" type="password" autocomplete="new-password" placeholder=""></label>
         <label>检测间隔（分钟）<input name="interval_minutes" type="number" min="1" max="1440" required></label>
         <label>TTFT 预警阈值 %（留空=全局）<input name="ttft_threshold_pct" type="number" min="1" step="any"></label>
         <label>手动基线 TTFT ms（留空=自动）<input name="baseline_manual_ms" type="number" min="1" step="any"></label>
         <label class="checkbox"><input type="checkbox" name="enabled" checked> 启用监控</label>
       </div>
+      <details class="advanced">
+        <summary>高级：自定义请求地址</summary>
+        <label>完整请求 URL（留空=使用资源端点）
+          <input name="endpoint_override" maxlength="1000" placeholder="https://<资源>.services.ai.azure.com/models/images/generations?api-version=...">
+          <small class="muted">仅用于不走 v1 API 的特殊模型，必须与资源端点是同一个主机，使用资源的 API Key。</small>
+        </label>
+      </details>
       <p class="error" id="model-form-error"></p>
       <div class="actions">
         <button class="btn" type="button" id="model-cancel">取消</button>
@@ -163,11 +219,61 @@
     </form>
   </dialog>
 
+  <!-- 添加/编辑资源 -->
+  <dialog id="resource-dialog">
+    <form id="resource-form" method="dialog">
+      <h2 id="resource-dialog-title">添加资源</h2>
+      <div class="form-grid">
+        <label>名称<input name="name" required maxlength="100" placeholder="myres-美东2"></label>
+        <label>API Key<input name="api_key" type="password" autocomplete="new-password"></label>
+        <label class="span2">端点 Endpoint
+          <input name="endpoint" required maxlength="1000" placeholder="https://your-resource.openai.azure.com/">
+          <small class="muted">支持 *.openai.azure.com / *.services.ai.azure.com / *.cognitiveservices.azure.com，自动使用 v1 API（/openai/v1）。</small>
+        </label>
+      </div>
+      <p class="error" id="resource-form-error"></p>
+      <div class="actions">
+        <button class="btn" type="button" id="resource-cancel">取消</button>
+        <button class="btn primary" type="submit">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 批量导入 -->
+  <dialog id="import-dialog" class="wide">
+    <div class="detail-head">
+      <h2>批量导入模型</h2>
+      <button class="btn" id="import-close">关闭</button>
+    </div>
+    <p class="muted small">从 Excel 复制整张表粘贴到下面，或选择 CSV 文件。第一行为表头，必填列：<b>资源</b>、<b>类型</b>（文本/图像）、<b>部署名称</b>；可选列：名称、检测间隔、预警阈值、手动基线、启用。资源需先在“资源”页创建，表中不包含任何 API Key。
+      <a href="/api/models/import-template" download>下载模板</a></p>
+    <div class="import-input">
+      <textarea id="import-text" rows="8" spellcheck="false" placeholder="资源	名称	类型	部署名称	检测间隔&#10;myres	GPT-5 美东2	文本	gpt-5	30"></textarea>
+      <div class="import-actions">
+        <label class="btn">选择文件<input type="file" id="import-file" accept=".csv,.tsv,.txt" hidden></label>
+        <button class="btn" id="import-preview-btn">预览</button>
+        <button class="btn primary" id="import-run-btn" disabled>导入</button>
+      </div>
+    </div>
+    <p id="import-msg" class="small"></p>
+    <div class="table-wrap import-preview">
+      <table class="table compact">
+        <thead><tr><th>行</th><th>结果</th><th>资源</th><th>名称</th><th>类型</th><th>部署名称</th><th>间隔</th><th>阈值</th><th>说明</th></tr></thead>
+        <tbody id="import-body"></tbody>
+      </table>
+    </div>
+  </dialog>
+
   <!-- 模型详情 -->
   <dialog id="detail-dialog" class="wide">
     <div class="detail-head">
       <h2 id="detail-title"></h2>
       <div>
+        <select id="detail-range" title="时间范围">
+          <option value="24">最近 24 小时</option>
+          <option value="168">最近 7 天</option>
+          <option value="720">最近 30 天</option>
+        </select>
         <button class="btn" id="detail-reset-baseline">重置自动基线</button>
         <button class="btn" id="detail-close">关闭</button>
       </div>

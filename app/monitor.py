@@ -89,6 +89,8 @@ class Monitor:
     # ---- lifecycle ----
     async def start(self) -> None:
         self.realign_schedule()
+        s = self.db.get_settings()
+        self.db.refresh_baseline_cache(None, int(s["baseline_window"]), int(s["baseline_min_samples"]))
         self._loop_task = asyncio.create_task(self._loop())
 
     def realign_schedule(self) -> None:
@@ -259,6 +261,7 @@ class Monitor:
         final = attempts[-1][1]
         prev = m["status"]
         self.db.update_model(model_id, {"status": final, "last_check_at": time.time()})
+        self.db.refresh_baseline_cache([model_id], int(settings["baseline_window"]), int(settings["baseline_min_samples"]))
         await self._maybe_alert(m, prev, final, attempts, baseline, pct, trigger)
 
     # ---- alerting ----
@@ -360,6 +363,7 @@ class Monitor:
             ("模型名称", name),
             ("模型类型", KIND_LABEL.get(m["kind"], m["kind"])),
             ("部署名称", m["deployment"]),
+            ("资源", m.get("resource_name") or "-"),
             ("触发方式", f"{TRIGGER_LABEL.get(trigger, trigger)}检测"),
             ("端点主机", host or "-"),
         ]
