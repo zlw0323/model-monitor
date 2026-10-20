@@ -1,0 +1,16 @@
+# 无域名时使用：直接用服务器公网 IP 提供 HTTPS（Caddy 内部 CA 自签证书，浏览器会提示“不安全”，确认一次即可）。
+# 使用方法见 README“没有域名：用 IP 访问”。有域名后改用 Caddyfile（自动申请正式证书）。
+{
+	# 用 IP 访问时浏览器不发送 SNI，用它选择证书
+	default_sni {$PUBLIC_IP}
+	# 不监听 80、不做 HTTP -> HTTPS 跳转
+	auto_https disable_redirects
+	# 不尝试把内部 CA 安装到容器的系统信任库
+	skip_install_trust
+}
+
+https://{$PUBLIC_IP} {
+	tls internal
+	encode gzip
+	reverse_proxy monitor:8000
+}

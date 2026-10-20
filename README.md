@@ -48,11 +48,14 @@ vi .env                                                          # 填 ADMIN_PAS
 #     .env 中设置 DOMAIN=monitor.example.com、COOKIE_SECURE=true
 docker compose --profile https up -d --build
 
-# 2b. 没有域名：.env 中设置 APP_BIND=0.0.0.0，访问 http://服务器IP:8000（明文，不推荐长期使用）
-docker compose up -d --build
+# 2b. 没有域名：用服务器 IP 提供 HTTPS（自签证书，浏览器首次访问需确认“继续访问”）
+#     .env 中设置 CADDYFILE=Caddyfile.ip、PUBLIC_IP=服务器公网IP、HTTPS_PORT=自选端口、
+#     HTTP_PUBLISH=127.0.0.1:8080、COOKIE_SECURE=true，访问 https://服务器IP:端口
+docker compose --profile https up -d --build
 ```
 
-服务器安全组需放行 80/443（方式 2a）或 8000（方式 2b）。
+服务器安全组需放行 80/443（方式 2a）或 `HTTPS_PORT`（方式 2b）。不建议用 `APP_BIND=0.0.0.0` 直接对外开放 8000（明文 HTTP，登录密码可被窃听）。
+以后有了域名：把 `CADDYFILE` 改回 `Caddyfile`、填 `DOMAIN`，再执行一次 `docker compose --profile https up -d`；正式证书签发需要公网能访问该服务器的 80 或 443 端口。
 
 登录后：
 1. **设置 → 邮件报警**：填写 SMTP（企业邮箱一般为 SSL 465），保存后点"发送测试邮件"。

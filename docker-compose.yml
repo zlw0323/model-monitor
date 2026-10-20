@@ -25,11 +25,14 @@ services:
     depends_on: [monitor]
     environment:
       - DOMAIN=${DOMAIN:-}
+      - PUBLIC_IP=${PUBLIC_IP:-}
     ports:
-      - "80:80"
-      - "443:443"
+      # HTTPS_PORT: public port of the panel. HTTP_PUBLISH: port 80 is only needed for certificate issuance
+      # with a domain; set it to 127.0.0.1:8080 to keep it closed (IP mode).
+      - "${HTTPS_PORT:-443}:443"
+      - "${HTTP_PUBLISH:-80}:80"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./${CADDYFILE:-Caddyfile}:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
     networks:
