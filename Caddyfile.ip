@@ -12,5 +12,11 @@
 https://{$PUBLIC_IP} {
 	tls internal
 	encode gzip
+	# 不暴露所用软件（Caddy / uvicorn）
+	header {
+		defer
+		-Server
+		-Via
+	}
 	reverse_proxy monitor:8000
 }

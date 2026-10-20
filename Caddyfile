@@ -1,5 +1,10 @@
 {$DOMAIN} {
 	encode gzip
-	header Strict-Transport-Security "max-age=31536000"
+	header {
+		defer
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+		-Via
+	}
 	reverse_proxy monitor:8000
 }
