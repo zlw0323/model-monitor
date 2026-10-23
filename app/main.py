@@ -22,7 +22,7 @@ from .feishu import send as send_feishu
 from .mailer import MailNotConfigured, send_mail
 from .monitor import Monitor
 from .probes import build_url
-from .scheduling import next_slot
+from .scheduling import IntervalPolicy, parse_hhmm
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 # httpx logs every request URL at INFO, which would print the Feishu webhook token into container logs.
@@ -41,6 +41,9 @@ SECURITY_HEADERS = {
 
 INT_SETTINGS = {
     "default_interval_minutes": (1, 1440),
+    "peak_schedule_enabled": (0, 1),
+    "peak_interval_minutes": (1, 1440),
+    "offpeak_interval_minutes": (1, 1440),
     "baseline_window": (3, 500),
     "baseline_min_samples": (1, 500),
     "retry_count": (0, 10),
@@ -56,6 +59,9 @@ INT_SETTINGS = {
 }
 FLOAT_SETTINGS = {"ttft_threshold_pct": (1, 10000)}
 TEXT_SETTINGS = ("smtp_host", "smtp_username", "smtp_from", "smtp_to")
+TIME_SETTINGS = ("peak_start", "peak_end")
+SCHEDULE_SETTINGS = {"default_interval_minutes", "peak_schedule_enabled", "peak_interval_minutes",
+                     "offpeak_interval_minutes", *TIME_SETTINGS}
 
 
 def _check_url(v: str) -> str:
@@ -72,6 +78,8 @@ class ModelIn(BaseModel):
     deployment: str = Field(min_length=1, max_length=200)
     endpoint_override: str | None = Field(None, max_length=1000)
     enabled: bool = True
+    # global = follow the global interval (peak/off-peak schedule); fixed = interval_minutes
+    interval_mode: Literal["global", "fixed"] = "global"
     interval_minutes: int = Field(30, ge=1, le=1440)
     ttft_threshold_pct: float | None = Field(None, gt=0, le=10000)
     baseline_manual_ms: float | None = Field(None, gt=0)
@@ -254,6 +262,7 @@ def create_app(
                   avail: dict | None, spark: list | None = None) -> dict:
         baseline, source = baseline_info(m, settings)
         avail = avail or {}
+        policy, now = IntervalPolicy.from_settings(settings, config.APP_TZ), time.time()
         out = {
             "id": m["id"],
             "name": m["name"],
@@ -267,7 +276,11 @@ def create_app(
             "endpoint_override": m["endpoint_override"],
             "request_url": build_url(m["endpoint"], m["kind"]),
             "enabled": bool(m["enabled"]),
+            "interval_mode": m["interval_mode"],
             "interval_minutes": m["interval_minutes"],
+            # interval in force right now, and the longest one the model can have (for gap detection in charts)
+            "interval_now": m["interval_minutes"] if m["interval_mode"] == "fixed" else policy.interval_at(now),
+            "interval_max": m["interval_minutes"] if m["interval_mode"] == "fixed" else policy.max_interval(),
             "ttft_threshold_pct": m["ttft_threshold_pct"],
             "effective_threshold_pct": Monitor.threshold_pct(m, settings),
             "baseline_manual_ms": m["baseline_manual_ms"],
@@ -367,7 +380,14 @@ def create_app(
         resources = [{"id": r["id"], "name": r["name"], "region": r["region"] or r["name"], "model_count": r["model_count"]}
                      for r in db.list_resources()]
         return {"models": models, "resources": resources, "now": now,
-                "monitor": {"network_down_since": mon.outage_since}}
+                "monitor": {"network_down_since": mon.outage_since}, "schedule": schedule_info(s, now)}
+
+    def schedule_info(s: dict[str, str], now: float) -> dict:
+        p = IntervalPolicy.from_settings(s, config.APP_TZ)
+        return {"enabled": p.enabled, "peak": p.is_peak(now), "interval_now": p.interval_at(now),
+                "peak_start": s.get("peak_start"), "peak_end": s.get("peak_end"), "peak_minutes": p.peak_minutes,
+                "offpeak_minutes": p.offpeak_minutes, "default_minutes": p.default_minutes,
+                "next_change": p.next_change(now)}
 
     @app.get("/api/models")
     def list_models(_: str = Depends(require_login), db: Database = Depends(db_dep), mon: Monitor = Depends(mon_dep)):
@@ -391,6 +411,7 @@ def create_app(
                 "deployment": body.deployment,
                 "endpoint_override": body.endpoint_override,
                 "enabled": int(body.enabled),
+                "interval_mode": body.interval_mode,
                 "interval_minutes": body.interval_minutes,
                 "ttft_threshold_pct": body.ttft_threshold_pct,
                 "baseline_manual_ms": body.baseline_manual_ms,
@@ -419,6 +440,7 @@ def create_app(
             "deployment": body.deployment,
             "endpoint_override": body.endpoint_override,
             "enabled": int(body.enabled),
+            "interval_mode": body.interval_mode,
             "interval_minutes": body.interval_minutes,
             "ttft_threshold_pct": body.ttft_threshold_pct,
             "baseline_manual_ms": body.baseline_manual_ms,
@@ -429,8 +451,8 @@ def create_app(
             fields.update(RESET_TARGET, baseline_reset_at=time.time())
         if target_changed or (body.enabled and not old["enabled"]):
             fields["next_run_at"] = time.time()
-        elif body.interval_minutes != old["interval_minutes"]:
-            fields["next_run_at"] = next_slot(model_id, body.interval_minutes, time.time())
+        elif body.interval_mode != old["interval_mode"] or body.interval_minutes != old["interval_minutes"]:
+            fields["next_run_at"] = mon.next_run_at({**old, **fields}, time.time(), mon.interval_policy())
         db.update_model(model_id, fields)
         return serialize_one(db, mon, model_id)
 
@@ -485,7 +507,8 @@ def create_app(
                     continue
                 model_id = db.insert_model({
                     "name": r.name, "kind": r.kind, "resource_id": r.resource_id, "deployment": r.deployment,
-                    "enabled": int(r.enabled), "interval_minutes": r.interval, "ttft_threshold_pct": r.threshold,
+                    "enabled": int(r.enabled), "interval_mode": "fixed" if r.interval else "global",
+                    "interval_minutes": r.interval or default_interval, "ttft_threshold_pct": r.threshold,
                     "baseline_manual_ms": r.baseline, "base_model": r.base_model or None,
                 })
                 db.update_model(model_id, {"next_run_at": soon(model_id, 300)})
@@ -603,7 +626,8 @@ def create_app(
         return public_settings(db)
 
     @app.put("/api/settings")
-    def put_settings(body: SettingsIn, _: str = Depends(require_login), db: Database = Depends(db_dep)):
+    def put_settings(body: SettingsIn, _: str = Depends(require_login), db: Database = Depends(db_dep),
+                     mon: Monitor = Depends(mon_dep)):
         out: dict[str, str] = {}
         for k, v in body.values.items():
             if k in INT_SETTINGS:
@@ -626,6 +650,12 @@ def create_app(
                 out[k] = f"{fv:g}"
             elif k in TEXT_SETTINGS:
                 out[k] = str(v or "").strip()
+            elif k in TIME_SETTINGS:
+                try:
+                    minutes = parse_hhmm(str(v or ""))
+                except ValueError as e:
+                    raise HTTPException(422, str(e))
+                out[k] = f"{minutes // 60:02d}:{minutes % 60:02d}"
             elif k == "network_check_urls":
                 try:
                     out[k] = ",".join(netcheck.parse_urls(str(v or "")))
@@ -638,6 +668,9 @@ def create_app(
             else:
                 raise HTTPException(422, f"未知设置项: {k}")
         current = db.get_settings()
+        merged = {**current, **out}
+        if merged.get("peak_schedule_enabled") == "1" and merged.get("peak_start") == merged.get("peak_end"):
+            raise HTTPException(422, "高峰开始时间和结束时间不能相同")
         smtp_target_changed = any(
             k in out and out[k] != current.get(k, "") for k in ("smtp_host", "smtp_port", "smtp_security")
         )
@@ -665,6 +698,8 @@ def create_app(
         elif body.feishu_secret:
             out["feishu_secret_enc"] = encrypt(body.feishu_secret.strip())
         db.set_settings(out)
+        if any(k in SCHEDULE_SETTINGS and out[k] != current.get(k) for k in out):
+            mon.realign_schedule()  # new intervals / peak hours take effect now, not after the next check
         if "baseline_window" in out or "baseline_min_samples" in out:
             s = db.get_settings()
             db.refresh_baseline_cache(None, int(s["baseline_window"]), int(s["baseline_min_samples"]))

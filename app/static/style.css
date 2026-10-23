@@ -193,3 +193,4 @@ pre { white-space: pre-wrap; background: #f9fafb; padding: 12px; border-radius: 
   .grid { grid-template-columns: 1fr; }
   main { padding: 12px; }
 }
+.schedule-hint { margin: -4px 0 12px; }

@@ -167,7 +167,7 @@ def test_import_preview_and_create(tmp_path):
         assert data["summary"] == {"ok": 2, "duplicate": 2, "error": 4} and data["created"] == 0
         rows = {row["line"]: row for row in data["rows"]}
         assert rows[3]["interval"] == 60 and rows[3]["threshold"] == 100 and rows[3]["kind"] == "image"
-        assert rows[4]["name"] == "o4-mini" and rows[4]["interval"] == 30
+        assert rows[4]["name"] == "o4-mini" and rows[4]["interval"] is None  # empty = follow the global schedule
         assert "不存在" in rows[5]["message"]
         assert len(c.get("/api/models").json()) == 1  # dry run created nothing
 

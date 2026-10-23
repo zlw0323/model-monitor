@@ -28,6 +28,12 @@ IMAGE_TIMEOUT_SECONDS = 300
 
 DEFAULT_SETTINGS = {
     "default_interval_minutes": "30",
+    # Models following the global interval: peak_interval in [peak_start, peak_end) local time, else offpeak.
+    "peak_schedule_enabled": "1",
+    "peak_start": "08:00",
+    "peak_end": "20:00",
+    "peak_interval_minutes": "15",
+    "offpeak_interval_minutes": "60",
     "ttft_threshold_pct": "50",
     "baseline_window": "20",
     "baseline_min_samples": "5",

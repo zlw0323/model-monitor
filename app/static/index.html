@@ -36,6 +36,7 @@
       <div id="tab-dashboard" class="tab">
         <div id="net-banner" class="net-banner hidden" role="alert"></div>
         <div class="summary chips" id="summary"></div>
+        <p class="muted small schedule-hint" id="schedule-hint"></p>
         <div class="toolbar">
           <div class="filters">
             <div class="segmented" id="view-switch" role="group" aria-label="视图">
@@ -133,10 +134,29 @@
       </div>
 
       <div id="tab-settings" class="tab hidden">
+        <form id="schedule-settings-form" method="post" action="/api/form-fallback" class="card">
+          <h2>检测间隔（峰谷时段）</h2>
+          <div class="form-grid">
+            <label>峰谷时段
+              <select name="peak_schedule_enabled">
+                <option value="1">开启：高峰、低谷使用不同间隔</option>
+                <option value="0">关闭：全天使用同一间隔</option>
+              </select>
+            </label>
+            <label class="schedule-off">全天检测间隔（分钟）<input name="default_interval_minutes" type="number" min="1" max="1440" required></label>
+            <label class="schedule-on">高峰开始时间<input name="peak_start" type="time" step="60" required></label>
+            <label class="schedule-on">高峰结束时间<input name="peak_end" type="time" step="60" required></label>
+            <label class="schedule-on">高峰检测间隔（分钟）<input name="peak_interval_minutes" type="number" min="1" max="1440" required></label>
+            <label class="schedule-on">低谷检测间隔（分钟）<input name="offpeak_interval_minutes" type="number" min="1" max="1440" required></label>
+          </div>
+          <p class="muted small" id="schedule-summary"></p>
+          <p class="muted small">时间按服务器时区计算。结束时间早于开始时间表示高峰跨越午夜（如 20:00~02:00）。设为“固定间隔”的模型不受影响；到时段切换时，各模型会在新间隔内重新错开检测，不会同时发起。保存后立即生效。</p>
+          <div class="actions"><button class="btn primary" type="submit">保存</button><span class="msg"></span></div>
+        </form>
+
         <form id="monitor-settings-form" method="post" action="/api/form-fallback" class="card">
           <h2>监控参数</h2>
           <div class="form-grid">
-            <label>新模型默认检测间隔（分钟）<input name="default_interval_minutes" type="number" min="1" max="1440" required></label>
             <label>TTFT 预警阈值（超出基线 %）<input name="ttft_threshold_pct" type="number" min="1" step="any" required></label>
             <label>基线样本窗口（最近 N 次正常检测的中位数）<input name="baseline_window" type="number" min="3" required></label>
             <label>启用 TTFT 预警的最少样本数<input name="baseline_min_samples" type="number" min="1" required></label>
@@ -241,7 +261,13 @@
             <option value="image">图像模型（TTFT = 完整出图耗时，low / 1024x1024 / JPEG）</option>
           </select>
         </label>
-        <label>检测间隔（分钟）<input name="interval_minutes" type="number" min="1" max="1440" required></label>
+        <label>检测间隔
+          <select name="interval_mode">
+            <option value="global">跟随全局设置（峰谷时段）</option>
+            <option value="fixed">固定间隔</option>
+          </select>
+        </label>
+        <label>固定间隔（分钟）<input name="interval_minutes" type="number" min="1" max="1440" required></label>
         <label>TTFT 预警阈值 %（留空=全局）<input name="ttft_threshold_pct" type="number" min="1" step="any"></label>
         <label>手动基线 TTFT ms（留空=自动）<input name="baseline_manual_ms" type="number" min="1" step="any"></label>
         <label class="checkbox"><input type="checkbox" name="enabled" checked> 启用监控</label>
@@ -291,7 +317,7 @@
       <h2>批量导入模型</h2>
       <button class="btn" id="import-close">关闭</button>
     </div>
-    <p class="muted small">从 Excel 复制整张表粘贴到下面，或选择 CSV 文件。第一行为表头，必填列：<b>资源</b>、<b>类型</b>（文本/图像）、<b>部署名称</b>；可选列：名称、模型（地区对照中的归类，留空=部署名称）、检测间隔、预警阈值、手动基线、启用。资源需先在“资源”页创建，表中不包含任何 API Key。
+    <p class="muted small">从 Excel 复制整张表粘贴到下面，或选择 CSV 文件。第一行为表头，必填列：<b>资源</b>、<b>类型</b>（文本/图像）、<b>部署名称</b>；可选列：名称、模型（地区对照中的归类，留空=部署名称）、检测间隔（填写=该模型固定间隔，留空=跟随全局峰谷时段）、预警阈值、手动基线、启用。资源需先在“资源”页创建，表中不包含任何 API Key。
       <a href="/api/models/import-template" download>下载模板</a></p>
     <div class="import-input">
       <textarea id="import-text" rows="8" spellcheck="false" placeholder="资源	名称	类型	部署名称	检测间隔&#10;myres	GPT-5 美东2	文本	gpt-5	30"></textarea>

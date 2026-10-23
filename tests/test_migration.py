@@ -58,6 +58,7 @@ def test_migrates_models_into_shared_resources(tmp_path):
         conn.execute("INSERT INTO checks (model_id, cycle_id, attempt, trigger, ts, success, ttft_ms) "
                      "VALUES (?, 'c', 0, 'schedule', ?, 1, 100)", (i, now))
     conn.execute("INSERT INTO alerts (model_id, ts, kind, subject, message) VALUES (1, ?, 'down', 's', 'm')", (now,))
+    conn.execute("UPDATE models SET interval_minutes = 120 WHERE name = 'b'")  # deliberately slower than default
     conn.commit()
     conn.close()
 
@@ -66,6 +67,8 @@ def test_migrates_models_into_shared_resources(tmp_path):
     assert sorted(res) == ["myres", "myres-2", "other"]
     assert res["myres"]["model_count"] == 3 and res["myres-2"]["model_count"] == 1
     by_name = {m["name"]: m for m in db.list_models()}
+    assert by_name["a"]["interval_mode"] == "global"
+    assert (by_name["b"]["interval_mode"], by_name["b"]["interval_minutes"]) == ("fixed", 120)
     assert by_name["a"]["resource_id"] == by_name["b"]["resource_id"] == by_name["e"]["resource_id"] != by_name["c"]["resource_id"]
     assert by_name["d"]["endpoint_override"] == models[3][2] and by_name["d"]["endpoint"] == models[3][2]
     assert by_name["e"]["endpoint_override"] is None

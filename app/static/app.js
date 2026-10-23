@@ -149,12 +149,24 @@ async function loadDashboard() {
   state.models = data.models;
   state.resList = data.resources;
   renderNetBanner(data.monitor && data.monitor.network_down_since);
+  renderScheduleHint(data.schedule);
   const ids = new Set(state.models.map((m) => m.id));
   for (const id of [...state.selected]) if (!ids.has(id)) state.selected.delete(id);
   renderResourceFilter();
   renderSummary();
   renderView();
   if (state.detailId && $("#detail-dialog").open) refreshDetail();
+}
+
+function renderScheduleHint(sch) {
+  const el = $("#schedule-hint");
+  if (!sch) return (el.textContent = "");
+  const at = sch.next_change ? fmtTime(sch.next_change).slice(11, 16) : "";
+  el.textContent = !sch.enabled
+    ? `检测间隔：全天每 ${sch.default_minutes} 分钟（峰谷时段已关闭）`
+    : sch.peak
+      ? `当前为高峰时段（${sch.peak_start}~${sch.peak_end}）：每 ${sch.peak_minutes} 分钟检测；${at} 起改为每 ${sch.offpeak_minutes} 分钟`
+      : `当前为低谷时段：每 ${sch.offpeak_minutes} 分钟检测；${at} 起进入高峰，每 ${sch.peak_minutes} 分钟`;
 }
 
 function renderNetBanner(since) {
@@ -513,7 +525,7 @@ function chartConfig(m, checks) {
     else okPts.push({ x, y: c.ttft_ms, c });
   }
   // Break the line at failures and at long gaps in the data, instead of drawing a slope across an outage.
-  const gapMs = Math.max(3 * m.interval_minutes * 60e3, 30 * 60e3);
+  const gapMs = Math.max(3 * (m.interval_max || m.interval_minutes) * 60e3, 30 * 60e3);
   const line = [];
   let prev = null;
   for (const p of [...okPts, ...anomalyPts, ...failPts].sort((a, b) => a.x - b.x)) {
@@ -574,7 +586,8 @@ async function refreshDetail() {
   $$("#detail-range button").forEach((b) => b.classList.toggle("active", Number(b.dataset.hours) === hours));
   $("#detail-title").textContent = m.name;
   $("#detail-status").innerHTML = statusCell(m);
-  $("#detail-meta").innerHTML = `${KIND[m.kind]} · 地区 ${esc(m.region)} · 资源 ${esc(m.resource_name)} · 部署 ${esc(m.deployment)}${m.base_model ? ` · 模型 ${esc(m.base_model)}` : ""}<br>请求地址：<code>${esc(m.request_url)}</code>${m.kind === "text" ? ` · token 参数：<code>${esc(m.token_param)}</code>` : ""}`;
+  const interval = m.interval_mode === "fixed" ? `固定每 ${m.interval_minutes} 分钟` : `跟随全局（当前每 ${m.interval_now} 分钟）`;
+  $("#detail-meta").innerHTML = `${KIND[m.kind]} · 地区 ${esc(m.region)} · 资源 ${esc(m.resource_name)} · 部署 ${esc(m.deployment)}${m.base_model ? ` · 模型 ${esc(m.base_model)}` : ""} · 检测间隔：${interval}<br>请求地址：<code>${esc(m.request_url)}</code>${m.kind === "text" ? ` · token 参数：<code>${esc(m.token_param)}</code>` : ""}`;
   const checks = await api(`/api/models/${m.id}/checks?hours=${hours}`).catch(() => []);
   if (detailChart) detailChart.destroy();
   detailChart = new Chart($("#detail-chart"), chartConfig(m, checks));
@@ -629,7 +642,7 @@ async function openModelDialog(m) {
   $("#model-dialog-title").textContent = m ? "编辑模型" : "添加模型";
   form.resource_id.innerHTML = resources.map((r) => `<option value="${r.id}">${esc(r.name)}</option>`).join("");
   if (m) {
-    for (const k of ["name", "kind", "deployment", "interval_minutes", "resource_id"]) form[k].value = m[k];
+    for (const k of ["name", "kind", "deployment", "interval_mode", "interval_minutes", "resource_id"]) form[k].value = m[k];
     form.ttft_threshold_pct.value = m.ttft_threshold_pct ?? "";
     form.baseline_manual_ms.value = m.baseline_manual_ms ?? "";
     form.endpoint_override.value = m.endpoint_override ?? "";
@@ -638,13 +651,22 @@ async function openModelDialog(m) {
     $(".advanced", form).open = Boolean(m.endpoint_override);
   } else {
     const s = await api("/api/settings").catch(() => ({}));
+    form.interval_mode.value = "global";
     form.interval_minutes.value = s.default_interval_minutes || 30;
     form.enabled.checked = true;
     if (state.filter.resource) form.resource_id.value = state.filter.resource;
     $(".advanced", form).open = false;
   }
+  syncIntervalMode();
   $("#model-dialog").showModal();
 }
+function syncIntervalMode() {
+  const f = $("#model-form");
+  const fixed = f.interval_mode.value === "fixed";
+  f.interval_minutes.disabled = !fixed;
+  f.interval_minutes.closest("label").classList.toggle("muted", !fixed);
+}
+$("#model-form").interval_mode.addEventListener("change", syncIntervalMode);
 $("#add-model-btn").addEventListener("click", () => openModelDialog(null));
 $("#model-cancel").addEventListener("click", () => $("#model-dialog").close());
 $("#model-form").addEventListener("submit", async (e) => {
@@ -658,6 +680,7 @@ $("#model-form").addEventListener("submit", async (e) => {
     deployment: f.deployment.value,
     endpoint_override: f.endpoint_override.value.trim() || null,
     enabled: f.enabled.checked,
+    interval_mode: f.interval_mode.value,
     interval_minutes: Number(f.interval_minutes.value),
     ttft_threshold_pct: num(f.ttft_threshold_pct.value),
     baseline_manual_ms: num(f.baseline_manual_ms.value),
@@ -724,7 +747,7 @@ async function runImport(dryRun) {
     const s = r.summary;
     const label = { ok: '<span class="badge ok">可导入</span>', duplicate: '<span class="badge muted">跳过</span>', error: '<span class="badge bad">错误</span>' };
     $("#import-body").innerHTML = r.rows.map((x) => `<tr><td>${x.line}</td><td>${label[x.status]}</td><td>${esc(x.resource)}</td><td>${esc(x.name)}</td>
-      <td>${KIND[x.kind] || esc(x.kind)}</td><td>${esc(x.deployment)}</td><td>${x.interval ?? ""}</td><td>${x.threshold ?? ""}</td><td class="small">${esc(x.message)}</td></tr>`).join("");
+      <td>${KIND[x.kind] || esc(x.kind)}</td><td>${esc(x.deployment)}</td><td>${x.interval ?? '<span class="muted">跟随全局</span>'}</td><td>${x.threshold ?? ""}</td><td class="small">${esc(x.message)}</td></tr>`).join("");
     if (dryRun) {
       importPreviewed = true;
       $("#import-run-btn").disabled = s.ok === 0;
@@ -898,11 +921,12 @@ $("#alert-close").addEventListener("click", () => $("#alert-dialog").close());
 async function loadSettings() {
   const s = await api("/api/settings").catch(() => null);
   if (!s) return;
-  for (const form of [$("#monitor-settings-form"), $("#smtp-settings-form")]) {
+  for (const form of [$("#schedule-settings-form"), $("#monitor-settings-form"), $("#smtp-settings-form")]) {
     for (const el of form.elements) {
       if (el.name && el.name in s && el.type !== "checkbox") el.value = s[el.name];
     }
   }
+  syncScheduleForm();
   const smtp = $("#smtp-settings-form");
   smtp.smtp_password.value = "";
   smtp.smtp_password.placeholder = s.smtp_password_set ? "已保存，留空保持不变" : "未设置";
@@ -930,6 +954,39 @@ $("#monitor-settings-form").addEventListener("submit", async (e) => {
   try {
     await api("/api/settings", { method: "PUT", body: { values } });
     flash(e.target, "已保存");
+  } catch (err) {
+    flash(e.target, err.message, true);
+  }
+});
+// Peak / off-peak schedule. Only the fields of the chosen mode are shown, but all are saved.
+function syncScheduleForm() {
+  const f = $("#schedule-settings-form");
+  const on = f.peak_schedule_enabled.value === "1";
+  $$(".schedule-on", f).forEach((el) => el.classList.toggle("hidden", !on));
+  $$(".schedule-off", f).forEach((el) => el.classList.toggle("hidden", on));
+  const [p, o] = [Number(f.peak_interval_minutes.value), Number(f.offpeak_interval_minutes.value)];
+  const [a, b] = [f.peak_start.value, f.peak_end.value];
+  const perDay = (n, minutes) => (n > 0 ? minutes / n : 0);
+  let text = "";
+  if (on && a && b && a !== b && p > 0 && o > 0) {
+    const toMin = (t) => Number(t.slice(0, 2)) * 60 + Number(t.slice(3, 5));
+    const peakLen = (toMin(b) - toMin(a) + 1440) % 1440;
+    const checks = perDay(p, peakLen) + perDay(o, 1440 - peakLen);
+    text = `高峰 ${a}~${b} 每 ${p} 分钟，其余时间每 ${o} 分钟；每个模型每天约检测 ${Math.round(checks)} 次（不含异常重测）。`;
+  } else if (!on && Number(f.default_interval_minutes.value) > 0) {
+    text = `全天每 ${f.default_interval_minutes.value} 分钟；每个模型每天约检测 ${Math.round(1440 / Number(f.default_interval_minutes.value))} 次（不含异常重测）。`;
+  }
+  $("#schedule-summary").textContent = text;
+}
+$("#schedule-settings-form").addEventListener("input", syncScheduleForm);
+$("#schedule-settings-form").addEventListener("change", syncScheduleForm);
+$("#schedule-settings-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const values = {};
+  for (const el of e.target.elements) if (el.name) values[el.name] = el.value;
+  try {
+    await api("/api/settings", { method: "PUT", body: { values } });
+    flash(e.target, "已保存，已按新间隔重新安排检测");
   } catch (err) {
     flash(e.target, err.message, true);
   }

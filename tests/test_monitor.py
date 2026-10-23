@@ -22,7 +22,8 @@ class Harness:
     def __init__(self, tmp_path, results=(), confirm_cycles=1):
         self.db = Database(tmp_path / "t.db")
         self.db.set_settings({"retry_gap_seconds": "0", "baseline_min_samples": "3", "smtp_host": "x", "smtp_to": "a@b.c",
-                              "recovery_confirm_cycles": str(confirm_cycles), "alert_merge_seconds": "0"})
+                              "recovery_confirm_cycles": str(confirm_cycles), "alert_merge_seconds": "0",
+                              "peak_schedule_enabled": "0"})  # one 30-minute interval all day, independent of the clock
         self.queue = list(results)
         self.mails = []
         self.notices = []

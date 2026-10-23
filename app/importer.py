@@ -26,8 +26,8 @@ KIND_VALUES = {
 TRUE_VALUES = ("1", "true", "yes", "y", "是", "启用", "开")
 FALSE_VALUES = ("0", "false", "no", "n", "否", "停用", "关")
 TEMPLATE = ("资源,名称,类型,部署名称,模型,检测间隔,预警阈值,手动基线\n"
-            "myres,GPT-5 美东2,文本,gpt-5,,30,,\n"
-            "myres,gpt-image-1 美东2,图像,gpt-image-1,,30,100,\n")
+            "myres,GPT-5 美东2,文本,gpt-5,,,,\n"
+            "myres,gpt-image-1 美东2,图像,gpt-image-1,,60,100,\n")
 
 
 @dataclass
@@ -123,7 +123,7 @@ def parse(text: str, resources: dict[str, int], existing: set[tuple[int, str, st
             r.base_model = cell(row, "base_model")
             if len(r.base_model) > 200:
                 raise ValueError("模型列过长")
-            r.interval = _number(cell(row, "interval"), int, 1, 1440, "检测间隔") or default_interval
+            r.interval = _number(cell(row, "interval"), int, 1, 1440, "检测间隔")  # empty = global schedule
             r.threshold = _number(cell(row, "threshold"), float, 1, 10000, "预警阈值")
             r.baseline = _number(cell(row, "baseline"), float, 1, 3_600_000, "手动基线")
             en = _norm(cell(row, "enabled"))

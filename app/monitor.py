@@ -19,7 +19,7 @@ from .feishu import send as send_feishu
 from .incidents import SLOW, Problem, describe
 from .mailer import MailNotConfigured, send_mail
 from .probes import TOKEN_PARAMS, ProbeResult, probe_image, probe_text
-from .scheduling import ProbeGate, next_slot, resource_key
+from .scheduling import IntervalPolicy, ProbeGate, next_run, resource_key
 
 log = logging.getLogger("monitor")
 
@@ -119,11 +119,21 @@ class Monitor:
         self._loop_task = asyncio.create_task(self._loop())
 
     def realign_schedule(self) -> None:
-        """Put every already-checked model on its staggered slot, so a restart doesn't fire them all at once."""
+        """Put every already-checked model on its staggered slot, so a restart doesn't fire them all at once.
+        Also applies changed intervals / peak hours right away."""
         now = time.time()
+        policy = self.interval_policy()
         for m in self.db.list_models():
             if m["enabled"] and m["last_check_at"] is not None:
-                self.db.update_model(m["id"], {"next_run_at": next_slot(m["id"], m["interval_minutes"], now)})
+                self.db.update_model(m["id"], {"next_run_at": self.next_run_at(m, now, policy)})
+
+    def interval_policy(self, settings: dict[str, str] | None = None) -> IntervalPolicy:
+        return IntervalPolicy.from_settings(settings or self.db.get_settings(), config.APP_TZ)
+
+    @staticmethod
+    def next_run_at(m: dict[str, Any], now: float, policy: IntervalPolicy) -> float:
+        fixed = m["interval_minutes"] if m.get("interval_mode") == "fixed" else None
+        return next_run(m["id"], now, policy, fixed)
 
     async def stop(self) -> None:
         tasks = [t for t in (self._loop_task, self._retry_task, self._flush_task, self._net_task,
@@ -171,7 +181,7 @@ class Monitor:
         if not m:
             return False
         if trigger == "schedule":
-            self.db.update_model(model_id, {"next_run_at": next_slot(model_id, m["interval_minutes"], time.time())})
+            self.db.update_model(model_id, {"next_run_at": self.next_run_at(m, time.time(), self.interval_policy())})
         task = asyncio.create_task(self.run_cycle(model_id, trigger))
         self._running[model_id] = task
         task.add_done_callback(lambda _t, mid=model_id: self._running.pop(mid, None))

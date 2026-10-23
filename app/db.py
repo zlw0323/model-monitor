@@ -34,7 +34,8 @@ MODEL_COLUMNS = """
     incident_since REAL,
     incident_ok INTEGER NOT NULL DEFAULT 0,
     incident_cycles INTEGER NOT NULL DEFAULT 0,
-    base_model TEXT
+    base_model TEXT,
+    interval_mode TEXT NOT NULL DEFAULT 'global'
 """
 
 # Columns added after the resources migration; ensured on every start for databases created in between.
@@ -47,6 +48,8 @@ MODEL_EXTRA_COLUMNS = (
     ("incident_ok", "INTEGER NOT NULL DEFAULT 0"),
     ("incident_cycles", "INTEGER NOT NULL DEFAULT 0"),
     ("base_model", "TEXT"),
+    # global = follow the global (peak/off-peak) interval; fixed = this model's interval_minutes
+    ("interval_mode", "TEXT NOT NULL DEFAULT 'global'"),
 )
 
 SCHEMA = f"""
@@ -152,12 +155,20 @@ class Database:
             if "region" not in {r[1] for r in self._conn.execute("PRAGMA table_info(resources)")}:
                 self._conn.execute("ALTER TABLE resources ADD COLUMN region TEXT NOT NULL DEFAULT ''")
             model_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(models)")}
+            had_interval_mode = "interval_mode" in model_cols
             if "resource_id" not in model_cols:
                 self._migrate_to_resources()
             model_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(models)")}
             for col, ddl in MODEL_EXTRA_COLUMNS:
                 if col not in model_cols:
                     self._conn.execute(f"ALTER TABLE models ADD COLUMN {col} {ddl}")
+            if not had_interval_mode:
+                # Upgrade to the peak/off-peak schedule: models still on the old default interval follow it,
+                # models whose interval was set deliberately keep that interval.
+                self._conn.execute(
+                    "UPDATE models SET interval_mode = 'fixed' WHERE interval_minutes != COALESCE("
+                    "(SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'default_interval_minutes'), 30)"
+                )
             # Models already alarmed before incident tracking existed: treat that as an open, already-notified
             # incident, so the upgrade doesn't re-send an alert for a problem the team already knows about.
             for kind in ("down", "slow"):
