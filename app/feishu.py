@@ -15,7 +15,7 @@ from .crypto import decrypt
 
 MAX_BODY_BYTES = 18 * 1024  # Feishu rejects request bodies over 20 KB.
 RATE_LIMIT_CODE = 11232
-HEADER_COLOR = {"down": "red", "slow": "orange", "recovered": "green", "test": "blue"}
+HEADER_COLOR = {"down": "red", "slow": "orange", "recovered": "green", "test": "blue", "report": "indigo"}
 
 
 class FeishuNotConfigured(Exception):
@@ -28,12 +28,13 @@ class FeishuError(Exception):
 
 @dataclass
 class Notice:
-    kind: str  # down | slow | recovered | test
+    kind: str  # down | slow | recovered | test | report
     title: str
     summary: str
     facts: list[tuple[str, str]] = field(default_factory=list)
     details: list[str] = field(default_factory=list)
     footer: str = ""
+    sections: list[tuple[str, list[str]]] = field(default_factory=list)  # (heading, lines), e.g. daily report
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -42,6 +43,7 @@ class Notice:
     def from_json(cls, raw: str) -> "Notice":
         d = json.loads(raw)
         d["facts"] = [tuple(x) for x in d.get("facts", [])]
+        d["sections"] = [(t, list(lines)) for t, lines in d.get("sections", [])]
         return cls(**d)
 
 
@@ -85,6 +87,9 @@ def build_card(n: Notice) -> dict:
     if n.details:
         elements.append({"tag": "hr"})
         elements.append({"tag": "div", "text": _plain("\n".join(n.details))})
+    for heading, lines in n.sections:
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "div", "text": _plain("\n".join([f"【{heading}】", *lines]))})
     if n.footer:
         elements.append({"tag": "note", "elements": [_plain(n.footer)]})
     return {
@@ -106,10 +111,19 @@ def build_payload(n: Notice, secret: str, now: int | None = None) -> dict:
         while True:
             hidden = len(details) - keep
             shown = details[:keep] + ([f"…另有 {hidden} 行未显示，见平台“报警记录”"] if hidden else [])
-            payload["card"] = build_card(Notice(n.kind, n.title, n.summary, n.facts, shown, n.footer))
+            payload["card"] = build_card(Notice(n.kind, n.title, n.summary, n.facts, shown, n.footer, n.sections))
             if size() <= MAX_BODY_BYTES or keep == 0:
                 break
             keep -= 1
+    if size() > MAX_BODY_BYTES and n.sections:
+        # Long report: show fewer lines per section until it fits; the full text is in the platform.
+        cap = max(len(lines) for _, lines in n.sections)
+        while size() > MAX_BODY_BYTES and cap > 0:
+            cap -= 1
+            cut = [(t, lines[:cap] + ([f"…另有 {len(lines) - cap} 行，见平台“报警记录”"] if len(lines) > cap else []))
+                   for t, lines in n.sections]
+            card_notice = Notice(n.kind, n.title, n.summary, n.facts, [], n.footer, cut)
+            payload["card"] = build_card(card_notice)
     if secret:
         ts = int(now if now is not None else time.time())
         payload = {"timestamp": str(ts), "sign": gen_sign(ts, secret), **payload}

@@ -5,13 +5,13 @@ import sqlite3
 import time
 import uuid
 from dataclasses import replace
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit
 
 import httpx
 
-from . import config, netcheck
+from . import config, netcheck, report
 from .crypto import decrypt
 from .db import Database
 from .feishu import FeishuNotConfigured, Notice
@@ -19,7 +19,7 @@ from .feishu import send as send_feishu
 from .incidents import SLOW, Problem, describe
 from .mailer import MailNotConfigured, send_mail
 from .probes import TOKEN_PARAMS, ProbeResult, probe_image, probe_text
-from .scheduling import IntervalPolicy, ProbeGate, next_run, resource_key
+from .scheduling import IntervalPolicy, ProbeGate, next_run, parse_hhmm, resource_key
 
 log = logging.getLogger("monitor")
 
@@ -46,6 +46,9 @@ NET_CHECK_CACHE_SECONDS = 30
 NETWORK_CODES = {"connect", "timeout", "disconnected", "http502", "http503", "http504"}
 NET_KINDS = {"net_down", "net_up"}
 MONITOR_SELF = "监控端"
+# The daily report is stored with the alerts (history, retries) but always sent on its own, never merged.
+REPORT_KIND = "daily"
+REPORT_NAME = "每日情报"
 # Each probe may make two requests (token-parameter / image-format fallback), each with its own timeout.
 PROBE_HARD_LIMIT_SECONDS = {
     "text": 2 * config.TEXT_TIMEOUT_SECONDS + 30,
@@ -75,8 +78,10 @@ class Monitor:
         feishu_fn: FeishuFn | None = None,
         network_fn: NetworkFn | None = None,
         tick_seconds: float = 5,
+        daily_reports: bool = True,
     ):
         self.db = db
+        self._daily_reports = daily_reports
         self._probe_override = probe_fn
         self._mail = mail_fn or send_mail
         self._feishu = feishu_fn or send_feishu
@@ -88,6 +93,7 @@ class Monitor:
         self._retry_task: asyncio.Task | None = None
         self._flush_task: asyncio.Task | None = None
         self._net_task: asyncio.Task | None = None
+        self._report_task: asyncio.Task | None = None
         self._fanout_at: dict[int, float] = {}
         self._send_lock = asyncio.Lock()
         self._net_lock = asyncio.Lock()
@@ -136,7 +142,7 @@ class Monitor:
         return next_run(m["id"], now, policy, fixed)
 
     async def stop(self) -> None:
-        tasks = [t for t in (self._loop_task, self._retry_task, self._flush_task, self._net_task,
+        tasks = [t for t in (self._loop_task, self._retry_task, self._flush_task, self._net_task, self._report_task,
                              *self._running.values()) if t]
         for t in tasks:
             t.cancel()
@@ -163,6 +169,10 @@ class Monitor:
             self._flush_task = asyncio.create_task(self.flush_alerts())
         if (self._retry_task is None or self._retry_task.done()) and self.db.due_alert_retries(now):
             self._retry_task = asyncio.create_task(self.retry_due_alerts())
+        if self._daily_reports and (self._report_task is None or self._report_task.done()):
+            day = self.report_due(settings, now)
+            if day:
+                self._report_task = asyncio.create_task(self.send_daily_report(day, scheduled=True))
         if now - self._last_purge > 3600:
             self._last_purge = now
             days = int(settings.get("retention_days") or 90)
@@ -456,7 +466,7 @@ class Monitor:
                 self.db.execute(f"UPDATE alerts SET queued = 0 WHERE id IN ({', '.join('?' for _ in ids)})", tuple(ids))
                 sends = []
                 for ch in CHANNELS:
-                    earlier = [a for a in self.db.retry_pending(ch) if a["id"] not in ids]
+                    earlier = [a for a in self.db.retry_pending(ch) if a["id"] not in ids and a["kind"] != REPORT_KIND]
                     sends.append(self._send(ch, earlier + rows, {a["id"] for a in earlier}))
                 await asyncio.gather(*sends)
         except asyncio.CancelledError:
@@ -470,12 +480,61 @@ class Monitor:
                 now = time.time()
                 for ch in CHANNELS:
                     pending = self.db.retry_pending(ch)
-                    if any(a[f"{ch}_retry_at"] <= now for a in pending):
-                        await self._send(ch, pending, {a["id"] for a in pending})
+                    alerts = [a for a in pending if a["kind"] != REPORT_KIND]
+                    if any(a[f"{ch}_retry_at"] <= now for a in alerts):
+                        await self._send(ch, alerts, {a["id"] for a in alerts})
+                    for a in pending:
+                        if a["kind"] == REPORT_KIND and a[f"{ch}_retry_at"] <= now:
+                            await self._send(ch, [a], {a["id"]})
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("alert retry failed")
+
+    # ---- daily report ----
+    def report_due(self, settings: dict[str, str], now: float) -> date | None:
+        """Yesterday, once the local send time has passed today and its report hasn't been made yet.
+        A server that was down at send time catches up when it comes back (same day)."""
+        if str(settings.get("daily_report_enabled", "1")) != "1":
+            return None
+        try:
+            at = parse_hhmm(settings.get("daily_report_time") or "09:00")
+        except ValueError:
+            at = 9 * 60
+        local = datetime.fromtimestamp(now, config.APP_TZ)
+        if local.hour * 60 + local.minute < at:
+            return None
+        day = local.date() - timedelta(days=1)
+        return None if settings.get("state_daily_report_day") == day.isoformat() else day
+
+    async def send_daily_report(self, day: date | None = None, scheduled: bool = False) -> int | None:
+        """Build the report for `day` (default yesterday), store it with the alerts and send it on its own.
+        Returns the alert id, or None when there was nothing to report."""
+        now = time.time()
+        yesterday = datetime.fromtimestamp(now, config.APP_TZ).date() - timedelta(days=1)
+        day = day or yesterday
+        if day == yesterday:
+            # Before building, so a failure can't make the scheduler retry in a loop; also stops the scheduled
+            # report from duplicating one sent by hand earlier that day.
+            self.db.set_settings({"state_daily_report_day": day.isoformat()})
+        try:
+            if scheduled and not any(m["enabled"] for m in self.db.list_models()):
+                return None
+            # ~1 s at 100 models: keep it off the event loop so in-flight probes' TTFT isn't skewed.
+            notice, brief = await asyncio.to_thread(report.build, self.db, day, self.db.get_settings(), config.APP_TZ, now)
+            alert_id = self.db.insert_alert(None, REPORT_KIND, notice.title, render_text(notice), notice.to_json(),
+                                            model_name=REPORT_NAME, brief=brief)
+            async with self._send_lock:
+                row = self.db.get_alert(alert_id)
+                await asyncio.gather(*(self._send(ch, [row], set()) for ch in CHANNELS))
+            return alert_id
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("daily report for %s failed", day)
+            if not scheduled:
+                raise
+            return None
 
     async def _send(self, channel: str, rows: list[dict], resend_ids: set[int]) -> None:
         if not rows:
@@ -628,10 +687,13 @@ def fmt_duration(seconds: float) -> str:
 
 
 def render_text(n: Notice) -> str:
-    lines = [n.summary, ""]
-    lines += [f"{k}：{v}" for k, v in n.facts]
+    lines = [n.summary]
+    if n.facts:
+        lines += [""] + [f"{k}：{v}" for k, v in n.facts]
     if n.details:
         lines += ["", "检测明细："] + [f"  {d}" for d in n.details]
+    for heading, items in n.sections:
+        lines += ["", f"【{heading}】"] + [f"  {d}" for d in items]
     if n.footer:
         lines += ["", n.footer]
     return "\n".join(lines)

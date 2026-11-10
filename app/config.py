@@ -34,6 +34,12 @@ DEFAULT_SETTINGS = {
     "peak_end": "20:00",
     "peak_interval_minutes": "15",
     "offpeak_interval_minutes": "60",
+    # Daily report of the previous local day, sent at daily_report_time (HH:MM).
+    "daily_report_enabled": "1",
+    "daily_report_time": "09:00",
+    "daily_report_ttft_pct": "20",
+    "daily_report_top_n": "10",
+    "state_daily_report_day": "",  # runtime state: last day (YYYY-MM-DD) a scheduled report was made for
     "ttft_threshold_pct": "50",
     "baseline_window": "20",
     "baseline_min_samples": "5",

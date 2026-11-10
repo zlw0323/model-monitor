@@ -154,6 +154,29 @@
           <div class="actions"><button class="btn primary" type="submit">保存</button><span class="msg"></span></div>
         </form>
 
+        <form id="report-settings-form" method="post" action="/api/form-fallback" class="card">
+          <h2>每日情报</h2>
+          <div class="form-grid">
+            <label>每日情报
+              <select name="daily_report_enabled">
+                <option value="1">开启</option>
+                <option value="0">关闭</option>
+              </select>
+            </label>
+            <label>发送时间（发送前一天的情报）<input name="daily_report_time" type="time" step="60" required></label>
+            <label>TTFT 波动阈值（%，超过才列出）<input name="daily_report_ttft_pct" type="number" min="5" max="500" required></label>
+            <label>每个列表最多显示（个）<input name="daily_report_top_n" type="number" min="1" max="50" required></label>
+          </div>
+          <p class="muted small">每天在发送时间把前一天 00:00 至 24:00 的情报发到飞书和邮件：总览、TTFT 波动（与前 7 天中位数比较）、可用性问题、异常事件、地区对比、高峰与低谷对比。全部由已有检测记录统计，不额外调用模型。服务器在发送时间不在线时，恢复后当天自动补发。历史情报在“报警记录”中查看。</p>
+          <div class="actions">
+            <button class="btn primary" type="submit">保存</button>
+            <input type="date" id="report-day" title="情报日期（默认昨天）">
+            <button class="btn" type="button" id="report-preview-btn">预览</button>
+            <button class="btn" type="button" id="report-send-btn">立即发送</button>
+            <span class="msg"></span>
+          </div>
+        </form>
+
         <form id="monitor-settings-form" method="post" action="/api/form-fallback" class="card">
           <h2>监控参数</h2>
           <div class="form-grid">

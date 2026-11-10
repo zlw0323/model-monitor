@@ -22,7 +22,7 @@ def make_client(tmp_path):
     app = create_app(
         db_path=tmp_path / "api.db",
         monitor_factory=lambda db: Monitor(db, probe_fn=probe, mail_fn=mail, feishu_fn=feishu, network_fn=network,
-                                           tick_seconds=0.05),
+                                           tick_seconds=0.05, daily_reports=False),
     )
     return TestClient(app)
 

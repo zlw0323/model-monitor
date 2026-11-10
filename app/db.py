@@ -103,6 +103,12 @@ CREATE TABLE IF NOT EXISTS alerts (
     queued INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts);
+-- An open incident cleared by editing the model/resource (no "recovered" alert): ends the incident for reports.
+CREATE TABLE IF NOT EXISTS incident_resets (
+    model_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+    ts REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_incident_resets_ts ON incident_resets(ts);
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -470,6 +476,18 @@ class Database:
     def purge_older_than(self, cutoff: float) -> None:
         self.execute("DELETE FROM checks WHERE ts < ?", (cutoff,))
         self.execute("DELETE FROM alerts WHERE ts < ?", (cutoff,))
+        self.execute("DELETE FROM incident_resets WHERE ts < ?", (cutoff,))
+
+    def record_incident_reset(self, model_id: int) -> None:
+        self.execute("INSERT INTO incident_resets (model_id, ts) VALUES (?, ?)", (model_id, time.time()))
+
+    # ---- daily report ----
+    def read_connection(self) -> sqlite3.Connection:
+        """A separate read-only connection for long report queries: with WAL it reads while the scheduler keeps
+        writing, instead of holding the shared connection's lock (which would stall probes and skew TTFT)."""
+        conn = sqlite3.connect(self._path.resolve().as_uri() + "?mode=ro", uri=True, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
 
     # ---- alerts ----
     def insert_alert(self, model_id: int | None, kind: str, subject: str, message: str, notice_json: str = "",

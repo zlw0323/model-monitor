@@ -9,7 +9,7 @@ const STATUS = {
   down: { label: "连通失败", cls: "bad" },
   unknown: { label: "未检测", cls: "muted" },
 };
-const ALERT_KIND = { down: "连通失败", slow: "TTFT 异常", changed: "异常变化", recovered: "恢复", net_down: "监控端网络中断", net_up: "监控端网络恢复" };
+const ALERT_KIND = { down: "连通失败", slow: "TTFT 异常", changed: "异常变化", recovered: "恢复", net_down: "监控端网络中断", net_up: "监控端网络恢复", daily: "每日情报" };
 const KIND = { text: "文本/推理", image: "图像" };
 
 const state = { models: [], resources: [], editingId: null, editingResourceId: null, detailId: null, timer: null };
@@ -871,7 +871,7 @@ async function loadAlerts() {
   const keep = new Set(selectedAlertIds());
   alertsCache = await api("/api/alerts").catch(() => alertsCache);
   $("#alerts-body").innerHTML = alertsCache.map((a, i) => {
-    const cls = a.kind === "recovered" || a.kind === "net_up" ? "ok" : a.kind === "down" || a.kind === "net_down" ? "bad" : "warn";
+    const cls = a.kind === "daily" ? "info" : a.kind === "recovered" || a.kind === "net_up" ? "ok" : a.kind === "down" || a.kind === "net_down" ? "bad" : "warn";
     return `<tr data-row="${a.id}"><td class="col-check"><input type="checkbox" data-id="${a.id}" aria-label="选择"></td>
       <td class="nowrap">${fmtTime(a.ts)}</td><td class="nowrap">${esc(a.model_name || "(已删除)")}${a.resource_name ? `<div class="muted small">${esc(a.resource_name)}</div>` : ""}</td>
       <td><span class="badge ${cls}">${ALERT_KIND[a.kind] || a.kind}</span></td>
@@ -921,7 +921,7 @@ $("#alert-close").addEventListener("click", () => $("#alert-dialog").close());
 async function loadSettings() {
   const s = await api("/api/settings").catch(() => null);
   if (!s) return;
-  for (const form of [$("#schedule-settings-form"), $("#monitor-settings-form"), $("#smtp-settings-form")]) {
+  for (const form of [$("#schedule-settings-form"), $("#report-settings-form"), $("#monitor-settings-form"), $("#smtp-settings-form")]) {
     for (const el of form.elements) {
       if (el.name && el.name in s && el.type !== "checkbox") el.value = s[el.name];
     }
@@ -979,6 +979,47 @@ function syncScheduleForm() {
   $("#schedule-summary").textContent = text;
 }
 $("#schedule-settings-form").addEventListener("input", syncScheduleForm);
+// Daily report: settings, preview (in the alert message dialog) and send now.
+$("#report-settings-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const values = {};
+  for (const el of e.target.elements) if (el.name) values[el.name] = el.value;
+  try {
+    await api("/api/settings", { method: "PUT", body: { values } });
+    flash(e.target, "已保存");
+  } catch (err) {
+    flash(e.target, err.message, true);
+  }
+});
+function reportDay() {
+  return $("#report-day").value || null;
+}
+$("#report-preview-btn").addEventListener("click", async () => {
+  const f = $("#report-settings-form");
+  flash(f, "生成中…");
+  try {
+    const day = reportDay();
+    const r = await api(`/api/reports/daily${day ? `?day=${encodeURIComponent(day)}` : ""}`);
+    $("#alert-title").textContent = r.title;
+    $("#alert-message").textContent = r.text;
+    $("#alert-dialog").showModal();
+    flash(f, "");
+  } catch (err) {
+    flash(f, err.message, true);
+  }
+});
+$("#report-send-btn").addEventListener("click", async () => {
+  const f = $("#report-settings-form");
+  const day = reportDay();
+  if (!confirm(`立即发送${day || "昨天"}的每日情报到飞书和邮件？`)) return;
+  flash(f, "发送中…");
+  try {
+    const r = await api("/api/reports/daily/send", { method: "POST", body: { day } });
+    flash(f, `飞书：${r.feishu_status}；邮件：${r.email_status}`, /失败/.test(`${r.feishu_status}${r.email_status}`));
+  } catch (err) {
+    flash(f, err.message, true);
+  }
+});
 $("#schedule-settings-form").addEventListener("change", syncScheduleForm);
 $("#schedule-settings-form").addEventListener("submit", async (e) => {
   e.preventDefault();

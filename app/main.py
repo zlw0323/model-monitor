@@ -3,6 +3,7 @@ import hmac
 import logging
 import time
 from contextlib import asynccontextmanager
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Literal
 from urllib.parse import urlsplit
@@ -14,13 +15,13 @@ from pydantic import BaseModel, Field, field_validator
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import config, importer, netcheck
+from . import config, importer, netcheck, report
 from .crypto import decrypt, encrypt, mask
 from .db import Database
 from .feishu import FeishuNotConfigured, Notice, is_webhook_url, mask_webhook
 from .feishu import send as send_feishu
 from .mailer import MailNotConfigured, send_mail
-from .monitor import Monitor
+from .monitor import Monitor, render_text
 from .probes import build_url
 from .scheduling import IntervalPolicy, parse_hhmm
 
@@ -44,6 +45,9 @@ INT_SETTINGS = {
     "peak_schedule_enabled": (0, 1),
     "peak_interval_minutes": (1, 1440),
     "offpeak_interval_minutes": (1, 1440),
+    "daily_report_enabled": (0, 1),
+    "daily_report_ttft_pct": (5, 500),
+    "daily_report_top_n": (1, 50),
     "baseline_window": (3, 500),
     "baseline_min_samples": (1, 500),
     "retry_count": (0, 10),
@@ -59,9 +63,9 @@ INT_SETTINGS = {
 }
 FLOAT_SETTINGS = {"ttft_threshold_pct": (1, 10000)}
 TEXT_SETTINGS = ("smtp_host", "smtp_username", "smtp_from", "smtp_to")
-TIME_SETTINGS = ("peak_start", "peak_end")
+TIME_SETTINGS = ("peak_start", "peak_end", "daily_report_time")
 SCHEDULE_SETTINGS = {"default_interval_minutes", "peak_schedule_enabled", "peak_interval_minutes",
-                     "offpeak_interval_minutes", *TIME_SETTINGS}
+                     "offpeak_interval_minutes", "peak_start", "peak_end"}
 
 
 def _check_url(v: str) -> str:
@@ -140,6 +144,10 @@ class SettingsIn(BaseModel):
 
 class NetTestIn(BaseModel):
     urls: str | None = Field(None, max_length=2000)  # unsaved form value; None = the saved setting
+
+
+class ReportIn(BaseModel):
+    day: str | None = Field(None, max_length=10)  # YYYY-MM-DD; None = yesterday
 
 
 class AlertDeleteIn(BaseModel):
@@ -449,6 +457,8 @@ def create_app(
         target_changed = any(old[k] != fields[k] for k in ("kind", "resource_id", "deployment", "endpoint_override"))
         if target_changed:
             fields.update(RESET_TARGET, baseline_reset_at=time.time())
+            if old["incident_kind"]:
+                db.record_incident_reset(model_id)
         if target_changed or (body.enabled and not old["enabled"]):
             fields["next_run_at"] = time.time()
         elif body.interval_mode != old["interval_mode"] or body.interval_minutes != old["interval_minutes"]:
@@ -578,6 +588,8 @@ def create_app(
             upd: dict[str, Any] = {}
             if endpoint_changed:
                 upd.update(RESET_TARGET, baseline_reset_at=time.time())
+                if m["incident_kind"]:
+                    db.record_incident_reset(m["id"])
             if (endpoint_changed or body.api_key) and m["enabled"]:
                 upd["next_run_at"] = soon(m["id"], 120)  # verify the new endpoint/key soon, without a burst
             db.update_model(m["id"], upd)
@@ -744,6 +756,31 @@ def create_app(
             raise HTTPException(422, str(e))
         ok, details = await netcheck.check(urls)
         return {"ok": ok, "details": details}
+
+    # ---- daily report ----
+    def report_day(raw: str | None) -> date:
+        today = datetime.now(config.APP_TZ).date()
+        if not raw:
+            return today - timedelta(days=1)
+        try:
+            day = date.fromisoformat(raw)
+        except ValueError:
+            raise HTTPException(422, "日期格式应为 YYYY-MM-DD")
+        if not today - timedelta(days=366) <= day <= today:
+            raise HTTPException(422, "只能生成最近一年内、不晚于今天的日报")
+        return day
+
+    @app.get("/api/reports/daily")
+    def preview_report(day: str | None = None, _: str = Depends(require_login), db: Database = Depends(db_dep)):
+        notice, brief = report.build(db, report_day(day), db.get_settings(), config.APP_TZ, time.time())
+        return {"title": notice.title, "brief": brief, "text": render_text(notice)}
+
+    @app.post("/api/reports/daily/send")
+    async def send_report(body: ReportIn, _: str = Depends(require_login), db: Database = Depends(db_dep),
+                          mon: Monitor = Depends(mon_dep)):
+        alert_id = await mon.send_daily_report(report_day(body.day))
+        a = db.get_alert(alert_id)
+        return {"id": alert_id, "email_status": a["email_status"], "feishu_status": a["feishu_status"]}
 
     # ---- frontend ----
     @app.middleware("http")
