@@ -10,7 +10,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 
-RUN useradd --system --uid 10001 monitor && mkdir -p /data && chown monitor /data
+# A restrictive host umask must not make copied source unreadable by the runtime user.
+RUN chmod -R a+rX /app/app \
+    && useradd --system --uid 10001 monitor && mkdir -p /data && chown monitor /data
 USER monitor
 VOLUME ["/data"]
 EXPOSE 8000
