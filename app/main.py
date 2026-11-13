@@ -48,6 +48,10 @@ INT_SETTINGS = {
     "daily_report_enabled": (0, 1),
     "daily_report_ttft_pct": (5, 500),
     "daily_report_top_n": (1, 50),
+    "official_rss_azure": (0, 1),
+    "official_rss_m365": (0, 1),
+    "official_rss_power_platform": (0, 1),
+    "official_rss_interval_minutes": (1, 60),
     "baseline_window": (3, 500),
     "baseline_min_samples": (1, 500),
     "retry_count": (0, 10),
@@ -758,6 +762,16 @@ def create_app(
         return {"ok": ok, "details": details}
 
     # ---- daily report ----
+    @app.get("/api/settings/official-rss")
+    def official_rss_status(_: str = Depends(require_login), mon: Monitor = Depends(mon_dep)):
+        return {"sources": mon.rss.status()}
+
+    @app.post("/api/settings/official-rss/check")
+    async def check_official_rss(_: str = Depends(require_login), mon: Monitor = Depends(mon_dep)):
+        sources = await mon.poll_official_rss()
+        await mon.flush_alerts(official_only=True)
+        return {"sources": sources}
+
     def report_day(raw: str | None) -> date:
         today = datetime.now(config.APP_TZ).date()
         if not raw:

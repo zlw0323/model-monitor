@@ -39,6 +39,10 @@ DEFAULT_SETTINGS = {
     "daily_report_time": "09:00",
     "daily_report_ttft_pct": "20",
     "daily_report_top_n": "10",
+    "official_rss_azure": "1",
+    "official_rss_m365": "1",
+    "official_rss_power_platform": "1",
+    "official_rss_interval_minutes": "5",
     "state_daily_report_day": "",  # runtime state: last day (YYYY-MM-DD) a scheduled report was made for
     "ttft_threshold_pct": "50",
     "baseline_window": "20",

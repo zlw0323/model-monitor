@@ -2,6 +2,7 @@ import sqlite3
 import statistics
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -113,6 +114,27 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS official_sources (
+    source TEXT PRIMARY KEY,
+    last_checked REAL,
+    last_success REAL,
+    etag TEXT NOT NULL DEFAULT '',
+    modified TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    item_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS official_items (
+    source TEXT NOT NULL,
+    ident TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    seen TEXT NOT NULL,
+    state TEXT NOT NULL,
+    notified INTEGER NOT NULL DEFAULT 0,
+    published REAL,
+    title TEXT NOT NULL,
+    link TEXT NOT NULL,
+    PRIMARY KEY(source, ident)
+);
 """
 
 _FULL_URL_SUFFIXES = ("/chat/completions", "/images/generations")
@@ -158,6 +180,8 @@ class Database:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(SCHEMA)
+            if "published" not in {r[1] for r in self._conn.execute("PRAGMA table_info(official_items)")}:
+                self._conn.execute("ALTER TABLE official_items ADD COLUMN published REAL")
             if "region" not in {r[1] for r in self._conn.execute("PRAGMA table_info(resources)")}:
                 self._conn.execute("ALTER TABLE resources ADD COLUMN region TEXT NOT NULL DEFAULT ''")
             model_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(models)")}
@@ -290,6 +314,17 @@ class Database:
         with self._lock:
             row = self._conn.execute(sql, params).fetchone()
             return dict(row) if row else None
+
+    @contextmanager
+    def transaction(self):
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
 
     # ---- settings ----
     def get_settings(self) -> dict[str, str]:

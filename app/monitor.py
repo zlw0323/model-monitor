@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from . import config, netcheck, report
+from . import config, netcheck, official_rss, report
 from .crypto import decrypt
 from .db import Database
 from .feishu import FeishuNotConfigured, Notice
@@ -49,6 +49,7 @@ MONITOR_SELF = "监控端"
 # The daily report is stored with the alerts (history, retries) but always sent on its own, never merged.
 REPORT_KIND = "daily"
 REPORT_NAME = "每日情报"
+STANDALONE_KINDS = {REPORT_KIND, *official_rss.KINDS}
 # Each probe may make two requests (token-parameter / image-format fallback), each with its own timeout.
 PROBE_HARD_LIMIT_SECONDS = {
     "text": 2 * config.TEXT_TIMEOUT_SECONDS + 30,
@@ -79,9 +80,14 @@ class Monitor:
         network_fn: NetworkFn | None = None,
         tick_seconds: float = 5,
         daily_reports: bool = True,
+        official_feeds: bool = True,
     ):
         self.db = db
         self._daily_reports = daily_reports
+        self._official_feeds = official_feeds
+        self.rss = official_rss.Watcher(db)
+        self._rss_at = 0.0
+        self._rss_task: asyncio.Task | None = None
         self._probe_override = probe_fn
         self._mail = mail_fn or send_mail
         self._feishu = feishu_fn or send_feishu
@@ -142,7 +148,7 @@ class Monitor:
         return next_run(m["id"], now, policy, fixed)
 
     async def stop(self) -> None:
-        tasks = [t for t in (self._loop_task, self._retry_task, self._flush_task, self._net_task, self._report_task,
+        tasks = [t for t in (self._loop_task, self._retry_task, self._flush_task, self._net_task, self._report_task, self._rss_task,
                              *self._running.values()) if t]
         for t in tasks:
             t.cancel()
@@ -165,8 +171,13 @@ class Monitor:
             # Our own network is down: model checks would only fail, so just watch for it to come back.
             self._net_task = asyncio.create_task(self.network_ok())
         settings = self.db.get_settings()
+        if self._official_feeds and (self._rss_task is None or self._rss_task.done()):
+            interval = int(settings.get("official_rss_interval_minutes") or 5) * 60
+            if now - self._rss_at >= interval:
+                self._rss_at = now
+                self._rss_task = asyncio.create_task(self.poll_official_rss())
         if (self._flush_task is None or self._flush_task.done()) and self._flush_due(now, settings):
-            self._flush_task = asyncio.create_task(self.flush_alerts())
+            self._flush_task = asyncio.create_task(self.flush_alerts(only_due=True))
         if (self._retry_task is None or self._retry_task.done()) and self.db.due_alert_retries(now):
             self._retry_task = asyncio.create_task(self.retry_due_alerts())
         if self._daily_reports and (self._report_task is None or self._report_task.done()):
@@ -451,22 +462,34 @@ class Monitor:
         rows = self.db.queued_alerts()
         if not rows:
             return False
+        if any(r["kind"] in official_rss.KINDS for r in rows):
+            return True
+        return self._merge_due(rows, now, settings)
+
+    @staticmethod
+    def _merge_due(rows: list[dict], now: float, settings: dict[str, str]) -> bool:
+        if not rows:
+            return False
         merge = int(settings.get("alert_merge_seconds") or 0)
         newest, oldest = max(r["ts"] for r in rows), min(r["ts"] for r in rows)
         return now - newest >= merge or now - oldest >= max(MERGE_MAX_WAIT_SECONDS, merge)
 
-    async def flush_alerts(self) -> None:
+    async def flush_alerts(self, only_due: bool = False, official_only: bool = False) -> None:
         """Send every queued alert as one message per channel (with any still-undelivered older alerts first)."""
         try:
             async with self._send_lock:
                 rows = self.db.queued_alerts()
                 if not rows:
                     return
+                await self._deliver_official()
+                rows = [r for r in rows if r["kind"] not in official_rss.KINDS]
+                if not rows or official_only or (only_due and not self._merge_due(rows, time.time(), self.db.get_settings())):
+                    return
                 ids = {r["id"] for r in rows}
                 self.db.execute(f"UPDATE alerts SET queued = 0 WHERE id IN ({', '.join('?' for _ in ids)})", tuple(ids))
                 sends = []
                 for ch in CHANNELS:
-                    earlier = [a for a in self.db.retry_pending(ch) if a["id"] not in ids and a["kind"] != REPORT_KIND]
+                    earlier = [a for a in self.db.retry_pending(ch) if a["id"] not in ids and a["kind"] not in STANDALONE_KINDS]
                     sends.append(self._send(ch, earlier + rows, {a["id"] for a in earlier}))
                 await asyncio.gather(*sends)
         except asyncio.CancelledError:
@@ -478,18 +501,50 @@ class Monitor:
         try:
             async with self._send_lock:
                 now = time.time()
+                await self._deliver_official()
                 for ch in CHANNELS:
                     pending = self.db.retry_pending(ch)
-                    alerts = [a for a in pending if a["kind"] != REPORT_KIND]
+                    alerts = [a for a in pending if a["kind"] not in STANDALONE_KINDS]
                     if any(a[f"{ch}_retry_at"] <= now for a in alerts):
                         await self._send(ch, alerts, {a["id"] for a in alerts})
                     for a in pending:
-                        if a["kind"] == REPORT_KIND and a[f"{ch}_retry_at"] <= now:
+                        if a["kind"] == REPORT_KIND and not a["queued"] and a[f"{ch}_retry_at"] <= now:
                             await self._send(ch, [a], {a["id"]})
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("alert retry failed")
+
+    async def _deliver_official(self) -> None:
+        """Under the delivery lock, send each service's queued/retry notices in publisher observation order."""
+        marks = ", ".join("?" for _ in official_rss.KINDS)
+        rows = self.db.all(
+            f"SELECT * FROM alerts WHERE kind IN ({marks}) AND (queued=1 OR feishu_retry_at IS NOT NULL) ORDER BY ts,id",
+            tuple(official_rss.KINDS))
+        blocked = set()
+        for row in rows:
+            source = row["model_name"]
+            if source in blocked:
+                continue
+            if not row["queued"] and row["feishu_retry_at"] > time.time():
+                blocked.add(source)
+                continue
+            if (row["feishu_status"] or "").startswith("已") and row["feishu_retry_at"] is None:
+                self.db.update_alert(row["id"], {"queued": 0})
+                continue  # restart after delivery succeeded but before the queued flag was cleared
+            await self._send("feishu", [row], {row["id"]} if not row["queued"] else set())
+            self.db.update_alert(row["id"], {"queued": 0})
+            if self.db.get_alert(row["id"])["feishu_retry_at"] is not None:
+                blocked.add(source)  # never deliver recovery before a still-retrying fault for this service
+
+    async def poll_official_rss(self) -> list[dict]:
+        try:
+            return await self.rss.poll()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("official RSS polling failed")
+            raise
 
     # ---- daily report ----
     def report_due(self, settings: dict[str, str], now: float) -> date | None:

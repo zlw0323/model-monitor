@@ -31,7 +31,7 @@ class Harness:
         self.net_up = True  # what the monitor-side network check reports
         self.net_calls = 0
         self.monitor = Monitor(self.db, probe_fn=self._probe, mail_fn=self._mail, feishu_fn=self._feishu,
-                               network_fn=self._network, daily_reports=False)
+                               network_fn=self._network, daily_reports=False, official_feeds=False)
         self.resource_id = self.db.insert_resource(
             {"name": "r", "endpoint": "https://r.openai.azure.com/", "api_key_enc": encrypt("k")}
         )

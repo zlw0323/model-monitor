@@ -228,7 +228,7 @@ def test_report_due_rules(tmp_path):
 def test_scheduled_report_is_sent_once_and_never_merged(tmp_path):
     h = Harness(tmp_path)
     h.db.set_settings({"daily_report_time": "00:00"})  # due at any time of day
-    mon = Monitor(h.db, mail_fn=h._mail, feishu_fn=h._feishu, network_fn=h._network)
+    mon = Monitor(h.db, mail_fn=h._mail, feishu_fn=h._feishu, network_fn=h._network, official_feeds=False)
 
     async def go():
         mon.tick()

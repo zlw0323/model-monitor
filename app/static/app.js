@@ -9,7 +9,7 @@ const STATUS = {
   down: { label: "连通失败", cls: "bad" },
   unknown: { label: "未检测", cls: "muted" },
 };
-const ALERT_KIND = { down: "连通失败", slow: "TTFT 异常", changed: "异常变化", recovered: "恢复", net_down: "监控端网络中断", net_up: "监控端网络恢复", daily: "每日情报" };
+const ALERT_KIND = { down: "连通失败", slow: "TTFT 异常", changed: "异常变化", recovered: "恢复", net_down: "监控端网络中断", net_up: "监控端网络恢复", daily: "每日情报", official_issue: "官方故障", official_update: "官方更新", official_recovered: "官方恢复" };
 const KIND = { text: "文本/推理", image: "图像" };
 
 const state = { models: [], resources: [], editingId: null, editingResourceId: null, detailId: null, timer: null };
@@ -860,6 +860,8 @@ function deliveryBadge(status) {
   const [cls, label] = s.startsWith("已发送") ? ["ok", "已发送" + merged]
     : s.startsWith("已补发") ? ["ok", "已补发" + merged]
     : s.startsWith("待合并") ? ["info", "合并中"]
+    : s.startsWith("不适用") ? ["muted", "不适用"]
+    : s.startsWith("待发送") ? ["info", "待发送"]
     : s.startsWith("未发送") ? ["muted", "未配置"]
     : s.startsWith("发送中") ? ["info", "发送中"]
     : s.includes("将自动重试") ? ["warn", "待重试"]
@@ -871,7 +873,7 @@ async function loadAlerts() {
   const keep = new Set(selectedAlertIds());
   alertsCache = await api("/api/alerts").catch(() => alertsCache);
   $("#alerts-body").innerHTML = alertsCache.map((a, i) => {
-    const cls = a.kind === "daily" ? "info" : a.kind === "recovered" || a.kind === "net_up" ? "ok" : a.kind === "down" || a.kind === "net_down" ? "bad" : "warn";
+    const cls = ["daily", "official_update"].includes(a.kind) ? "info" : ["recovered", "net_up", "official_recovered"].includes(a.kind) ? "ok" : ["down", "net_down", "official_issue"].includes(a.kind) ? "bad" : "warn";
     return `<tr data-row="${a.id}"><td class="col-check"><input type="checkbox" data-id="${a.id}" aria-label="选择"></td>
       <td class="nowrap">${fmtTime(a.ts)}</td><td class="nowrap">${esc(a.model_name || "(已删除)")}${a.resource_name ? `<div class="muted small">${esc(a.resource_name)}</div>` : ""}</td>
       <td><span class="badge ${cls}">${ALERT_KIND[a.kind] || a.kind}</span></td>
@@ -921,7 +923,7 @@ $("#alert-close").addEventListener("click", () => $("#alert-dialog").close());
 async function loadSettings() {
   const s = await api("/api/settings").catch(() => null);
   if (!s) return;
-  for (const form of [$("#schedule-settings-form"), $("#report-settings-form"), $("#monitor-settings-form"), $("#smtp-settings-form")]) {
+  for (const form of [$("#schedule-settings-form"), $("#report-settings-form"), $("#monitor-settings-form"), $("#official-rss-form"), $("#smtp-settings-form")]) {
     for (const el of form.elements) {
       if (el.name && el.name in s && el.type !== "checkbox") el.value = s[el.name];
     }
@@ -939,7 +941,50 @@ async function loadSettings() {
   fs.feishu_webhook_clear.checked = false;
   fs.feishu_secret_clear.checked = false;
   $("#network-settings-form").network_check_urls.value = (s.network_check_urls || "").split(",").join("\n");
+  await loadOfficialRssStatus();
 }
+
+function renderOfficialRssStatus(sources) {
+  $("#official-rss-status").innerHTML = sources.map((s) => {
+    const label = !s.enabled ? "已关闭" : s.error ? s.error : s.last_success ? `获取成功（${s.item_count} 条通告）` : "等待首次获取";
+    return `<p><b>${esc(s.name)}</b>：<span class="${s.error && s.enabled ? "error" : "muted"}">${esc(label)}</span> · 上次检查 ${fmtTime(s.last_checked)} · 上次成功 ${fmtTime(s.last_success)}</p>`;
+  }).join("");
+}
+async function loadOfficialRssStatus() {
+  try {
+    const data = await api("/api/settings/official-rss");
+    renderOfficialRssStatus(data.sources);
+  } catch (err) {
+    $("#official-rss-status").textContent = `订阅状态加载失败：${err.message}`;
+  }
+}
+$("#official-rss-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const values = {};
+  for (const el of e.target.elements) if (el.name) values[el.name] = el.value;
+  try {
+    await api("/api/settings", { method: "PUT", body: { values } });
+    await loadOfficialRssStatus();
+    flash(e.target, "已保存");
+  } catch (err) {
+    flash(e.target, err.message, true);
+  }
+});
+$("#official-rss-check").addEventListener("click", async (e) => {
+  const f = $("#official-rss-form");
+  e.target.disabled = true;
+  flash(f, "获取官方通告中…");
+  try {
+    const data = await api("/api/settings/official-rss/check", { method: "POST" });
+    renderOfficialRssStatus(data.sources);
+    const failed = data.sources.filter((s) => s.enabled && s.error);
+    flash(f, failed.length ? `${failed.length} 个订阅获取失败，见上方状态` : "检查完成，新通告已进入飞书发送队列", failed.length > 0);
+  } catch (err) {
+    flash(f, err.message, true);
+  } finally {
+    e.target.disabled = false;
+  }
+});
 function flash(form, text, isError) {
   const el = $(".msg", form);
   el.textContent = text;
